@@ -1,44 +1,38 @@
 /**
- * 伤情局部更新协议(conditionPatch)。
+ * 伤情局部补丁(conditionPatch)——仅供重放旧存档。
  *
- * 背景:protagonist.condition / npcs.condition 是覆盖型字符串。整段覆盖有两个老问题:
- *   1. 模型只提"新伤",重写时容易把尚未解除的旧伤/活动限制挤掉;
- *   2. 「痊愈/恢复正常」时填空字符串,会一次清光所有伤情(等于自动回血)。
- *
- * conditionPatch 把已有 condition 切成编号片段(c1、c2…),只允许按编号替换/新增,
- * 未列入的片段由程序原样保留。片段编号只在**单次请求内**有效:注入时按同一套
- * splitConditionFragments 规则切分,解析返回时再按同规则切分,编号即对齐。
+ * v0.17 曾让模型按编号片段(c1、c2…)局部改 condition。状态通常就几条,这套协议收益小,
+ * 格式复杂、模型易写错,编号原样入库还会随前面楼层变动而错位,已改回与 outfit 相同的全文覆盖。
+ * 旧存档叶子里仍存着补丁,这里保留切分与施加逻辑让它们照常重放,否则老聊天的状态会变样。
  */
 
 import type { ConditionPatch } from './types';
 
-/** 片段之间的显示/存储分隔符。 */
+/** 片段之间的存储分隔符。 */
 export const CONDITION_FRAGMENT_SEP = '；';
 
-/** 片段编号前缀与正则(仅本请求内有效)。 */
 const FRAGMENT_ID_RE = /^c(\d+)$/i;
-export function conditionFragmentId(index: number): string {
-  return `c${index + 1}`;
-}
+/** 旧存档正文里可能抄进了显示编号,还会叠多层(`[c1] [c1] …`)。 */
+const FRAGMENT_PREFIX_RE = /^(?:[[【]\s*c\d+\s*[\]】]\s*)+/i;
+const FRAGMENT_PREFIX_ANY_RE = /(^|[；;。\n])\s*(?:[[【]\s*c\d+\s*[\]】]\s*)+/gi;
 
 /**
- * 把一段 condition 切成编号片段。按中文/英文分号、句号、换行切,逗号不切
- * (「手臂受伤,夹板固定,暂不能提重物」应作为一个片段整体替换)。
+ * 把一段 condition 切成片段。按中文/英文分号、句号、换行切,逗号不切
+ * (「手臂受伤,夹板固定,暂不能提重物」当时作为一个片段整体替换)。
+ * 抄进去的 `[cN]` 前缀不算内容。
  */
 export function splitConditionFragments(condition: string | undefined): string[] {
   const text = (condition ?? '').trim();
   if (!text) return [];
   return text
     .split(/[；;。\n]+/)
-    .map(s => s.trim())
+    .map(s => s.replace(FRAGMENT_PREFIX_RE, '').trim())
     .filter(Boolean);
 }
 
-/** 把 condition 渲染成带编号的片段列表,供提示词注入;空则返回空串。 */
-export function fmtConditionFragments(condition: string | undefined): string {
-  return splitConditionFragments(condition)
-    .map((frag, i) => `[${conditionFragmentId(i)}] ${frag}`)
-    .join(CONDITION_FRAGMENT_SEP);
+/** 剥掉被抄进正文的显示编号(`[c1] 手臂受伤；[c2] …` → `手臂受伤；…`),其余原样保留。 */
+export function stripConditionFragmentIds(condition: string): string {
+  return condition.replace(FRAGMENT_PREFIX_ANY_RE, '$1').trim();
 }
 
 /**
@@ -53,22 +47,27 @@ export function applyConditionPatch(
 ): string | undefined {
   if (!patch) return current;
   const fragments = splitConditionFragments(current);
-  const next = [...fragments];
+  // 编号全部相对施加前的片段:先收齐再一次性重建。边遍历边 splice 会让后续编号整体左移,
+  // 同一补丁里删两段、或删一段改一段时就会删错/改错,越界的那条还静默落空。
+  const replaced = new Map<number, string>();
   for (const op of patch.replace ?? []) {
-    const m = typeof op.id === 'string' ? op.id.match(FRAGMENT_ID_RE) : null;
+    const m = typeof op.id === 'string' ? op.id.trim().match(FRAGMENT_ID_RE) : null;
     if (!m) continue;
     const idx = Number(m[1]) - 1;
-    if (idx < 0 || idx >= next.length) continue;
-    const text = op.text.trim();
-    if (!text) next.splice(idx, 1);
-    else next[idx] = text;
+    if (idx < 0 || idx >= fragments.length) continue;
+    replaced.set(idx, op.text);
   }
-  for (const op of patch.add ?? []) {
-    const text = op.text.trim();
-    if (text) next.push(text);
-  }
-  const joined = next.join(CONDITION_FRAGMENT_SEP).trim();
-  return joined || undefined;
+  const next: string[] = [];
+  // 写回的文本按同一规则再切一次并去掉完全重复:text 里带句号/分号不该凭空多出片段,
+  // 同一句话也不该挂两遍。
+  const push = (text: string) => {
+    for (const frag of splitConditionFragments(text)) {
+      if (!next.includes(frag)) next.push(frag);
+    }
+  };
+  fragments.forEach((frag, i) => push(replaced.get(i) ?? frag));
+  for (const op of patch.add ?? []) push(op.text);
+  return next.join(CONDITION_FRAGMENT_SEP) || undefined;
 }
 
 /** 是否是一个有实际内容、可施加的补丁。 */

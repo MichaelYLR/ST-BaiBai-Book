@@ -25,7 +25,7 @@ import { getLeaf, leafValid, deleteLeafAt, editLeafFull, planContentById, descri
 import { engineState, floorBackfillState, regenerateFloor, setFloorOmit, summarizeFloor } from '@/memory/engine';
 import { derivedMeta } from '@/memory/store';
 import { ui } from '@/state/ui';
-import type { LeafExtra, StoredDelta, ItemDelta, NpcDelta, ProtagonistDelta, VarOp, JsonValue } from '@/memory/types';
+import type { LeafExtra, StoredDelta, ItemDelta, NpcDelta, ProtagonistDelta, ConditionPatch, VarOp, JsonValue } from '@/memory/types';
 
 const props = defineProps<{ floor: number; sig: { tick: number } }>();
 
@@ -132,6 +132,15 @@ const NPC_FIELDS = [
   { key: 'location', draft: 'npcLoc', label: '位置' },
 ] as const;
 
+/** 旧存档里的伤情片段补丁(新叶子入库前已固化成全文):列出来,重放实际施加了什么才看得见。 */
+function fmtConditionPatch(p: ConditionPatch | undefined): string {
+  if (!p) return '';
+  return [
+    ...(p.replace ?? []).map(op => op.text ? `改${op.id}→${op.text}` : `删${op.id}`),
+    ...(p.add ?? []).map(op => `加:${op.text}`),
+  ].join('；');
+}
+
 // 角色变动:主文本=名(·身份);副文本=delta 里本轮出现的字段。更新 delta 只含被改字段,
 // 故副文本恰好就是「这层楼改了什么」——之前挤在一行还居中,极难读,拆成副行后清爽。
 function fmtNpc(x: NpcDelta): { text: string; sub?: string } {
@@ -144,6 +153,8 @@ function fmtNpc(x: NpcDelta): { text: string; sub?: string } {
   if (affinity) parts.push(`好感估计:${affinity}`);
   if (x.outfit) parts.push(`着装:${x.outfit}`);
   if (x.condition) parts.push(`状态:${x.condition}`);
+  const patch = fmtConditionPatch(x.conditionPatch);
+  if (patch) parts.push(`状态补丁:${patch}`);
   if (x.desc) parts.push(`外貌:${x.desc}`);
   if (x.personality) parts.push(`性格:${x.personality}`);
   if (x.ties) parts.push(`人际:${x.ties}`);
@@ -174,7 +185,7 @@ const npcTags = computed<Tag[]>(() => {
 const protagonistTags = computed<Tag[]>(() => {
   const protagonist = d.value?.protagonist;
   if (!protagonist) return [];
-  // conditionPatch 不是文本字段(对象),不进标签流;用 Partial 只列要展示的文本键。
+  // conditionPatch 是对象,不走文本键;用 Partial 只列文本键,补丁单独格式化追加。
   const labels: Partial<Record<keyof ProtagonistDelta, string>> = {
     gender: '性别',
     age: '年龄',
@@ -187,6 +198,8 @@ const protagonistTags = computed<Tag[]>(() => {
   const parts = (Object.keys(labels) as Array<keyof ProtagonistDelta>)
     .filter(key => protagonist[key] !== undefined)
     .map(key => `${labels[key]}:${protagonist[key] || '(清空)'}`);
+  const patch = fmtConditionPatch(protagonist.conditionPatch);
+  if (patch) parts.push(`状态补丁:${patch}`);
   if (!parts.length) return [];
   return [{
     key: 'protagonist:update:0',
@@ -222,6 +235,11 @@ const planTags = computed<Tag[]>(() => {
     const verb = oc === 'done' ? '达成' : oc === 'cancelled' ? '取消' : oc === 'failed' ? '失败' : '了结';
     const reason = typeof r === 'string' ? '' : (r.reason?.trim() ?? '');
     out.push({ key: `plan:resolve:${i}`, op: 'resolve', bucket: 'resolve', idx: i, text: planLabel(verb, id), sub: reason || undefined, editable: false });
+  });
+  // update 此前不显示:改过的内容/期限在楼层面板里无从查起,也删不掉
+  (pl.update ?? []).forEach((u, i) => {
+    const sub = [u.content && `内容:${u.content}`, u.targetTime !== undefined && `期限:${u.targetTime || '(清除)'}`].filter(Boolean).join(' · ');
+    out.push({ key: `plan:update:${i}`, op: 'update', bucket: 'update', idx: i, text: planLabel('更新', u.id), sub: sub || undefined, editable: false });
   });
   (pl.reopen ?? []).forEach((id, i) => out.push({ key: `plan:reopen:${i}`, op: 'reopen', bucket: 'reopen', idx: i, text: planLabel('重启', id), editable: false }));
   (pl.remove ?? []).forEach((id, i) => out.push({ key: `plan:remove:${i}`, op: 'remove', bucket: 'remove', idx: i, text: planLabel('删除', id), editable: false }));
@@ -420,7 +438,9 @@ const editingNpcDelta = computed(() => {
 });
 const npcEditFields = computed(() => {
   const npc = editingNpcDelta.value;
-  return npc ? NPC_FIELDS.filter(f => editKey.value?.startsWith('npc:add:') || npc[f.key] !== undefined) : [];
+  // 带旧片段补丁的条目也露出状态栏:填全文即可覆盖该补丁
+  return npc ? NPC_FIELDS.filter(f => editKey.value?.startsWith('npc:add:') || npc[f.key] !== undefined
+    || (f.key === 'condition' && !!npc.conditionPatch)) : [];
 });
 const npcAffinityEditFields = computed(() => {
   const npc = editingNpcDelta.value;
@@ -532,6 +552,8 @@ function saveTag(tag: Tag) {
             if (t || (f.key === 'affinityNote' && x.affinityNote !== undefined)) rec[f.key] = t;
             else delete rec[f.key];
           }
+          // 手写了状态全文,旧存档的片段补丁随之作废(重放时全文优先,这里顺手清掉免得误导)
+          if (x.condition !== undefined) delete x.conditionPatch;
           for (const { key } of NPC_AFFINITY_FIELDS) {
             // update 未提供的一侧必须继续省略,不能因编辑另一侧而写成未知。
             if (x[key] !== undefined || (tag.bucket === 'add' && edit[key] !== '')) {

@@ -529,9 +529,9 @@ export interface NpcDelta extends NpcAffinity {
   personality?: string;
   /** 当前着装(即时层,覆盖型) */
   outfit?: string;
-  /** 当前状态/健康(即时层,覆盖型)。首次记录用此字段;已有非空伤情改用 conditionPatch */
+  /** 当前状态/健康(即时层,覆盖型) */
   condition?: string;
-  /** 伤情局部更新(已有非空 condition 时使用;编号 c1/c2 仅本请求有效) */
+  /** 旧存档的伤情局部补丁(v0.17 编号协议,已停用):仅重放,新输出不再产生 */
   conditionPatch?: ConditionPatch;
   /** 非空 location 时的本轮正文连续定位短引(仅校验,不存档) */
   locationEvidence?: string;
@@ -559,14 +559,14 @@ export interface ProtagonistDelta {
   identity?: string;
   appearance?: string;
   outfit?: string;
-  /** 首次记录用此字段;已有非空伤情改用 conditionPatch */
+  /** 当前状态/健康(覆盖型) */
   condition?: string;
-  /** 伤情局部更新(已有非空 condition 时使用;编号 c1/c2 仅本请求有效) */
+  /** 旧存档的伤情局部补丁(v0.17 编号协议,已停用):仅重放,新输出不再产生 */
   conditionPatch?: ConditionPatch;
 }
 
 /**
- * 伤情局部更新协议的片段操作。
+ * 旧版伤情局部补丁的片段操作(仅重放旧存档)。
  * - replace 用 id(c1/c2…)定位旧片段,text 为空串表示清除该片段;
  * - add 追加新片段,不带 id;
  * 未列入 replace 的旧片段由程序原样保留。编号只在单次请求内有效。

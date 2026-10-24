@@ -16,7 +16,7 @@
 import { getContext, getDoNewChat, setMessageText, type STMessage } from '@/st/context';
 import { toast } from '@/st/toast';
 import { apiSettings } from '@/api/settings';
-import { deriveMemory, makeLeafId } from './apply';
+import { deriveMemory, makeLeafId, planId } from './apply';
 import { resolveKeepStart } from './engine';
 import { refreshInjection, renderHistoryNodes, selectHistoryNodesBefore } from './inject';
 import { latestStoryTime } from './timeTag';
@@ -186,8 +186,8 @@ function encodeStateAsDelta(state: ReturnType<typeof deriveMemory>, leafId: stri
   return delta;
 }
 
-/** 深拷贝一条要搬运的消息,取消隐藏、保留叶子。 */
-function sanitizeCarryMessage(m: STMessage, detailIds: ReadonlyMap<string, string>): STMessage {
+/** 深拷贝一条要搬运的消息,取消隐藏、保留叶子。(导出供测试) */
+export function sanitizeCarryMessage(m: STMessage, detailIds: ReadonlyMap<string, string>, planIds: ReadonlyMap<string, string>): STMessage {
   const clone: STMessage = JSON.parse(JSON.stringify(m));
   clone.is_system = false;
   if (clone.extra && 'bbs_hidden' in clone.extra) {
@@ -200,6 +200,16 @@ function sanitizeCarryMessage(m: STMessage, detailIds: ReadonlyMap<string, strin
     for (const update of life.update ?? []) update.id = detailIds.get(update.id) ?? update.id;
     for (const key of ['archive', 'remove'] as const) {
       if (life[key]) life[key] = life[key].map(id => detailIds.get(id) ?? id);
+    }
+  }
+  // 未了结计划同样改挂种子叶,同理同步窗口内的了结/更新/重启/删除引用。
+  const plans = clone.extra?.bbs_leaf?.delta.plans;
+  if (plans) {
+    const remap = (id: string) => planIds.get(id) ?? id;
+    if (plans.resolve) plans.resolve = plans.resolve.map(r => typeof r === 'string' ? remap(r) : { ...r, id: remap(r.id) });
+    for (const update of plans.update ?? []) update.id = remap(update.id);
+    for (const key of ['reopen', 'remove'] as const) {
+      if (plans[key]) plans[key] = plans[key].map(remap);
     }
   }
   return clone;
@@ -270,6 +280,8 @@ export async function createNewChatWithCarryover(): Promise<boolean> {
   const seedLeafId = makeLeafId();
   const seedDelta = encodeStateAsDelta(stateBefore, seedLeafId);
   const detailIds = new Map(stateBefore.lifeDetails.map((d, i) => [d.id, `detail:${seedLeafId}#${i}`]));
+  // 与 encodeStateAsDelta 的 plans.add 同序:第 i 个未了结计划 → 种子叶的第 i 条
+  const planIds = new Map(stateBefore.plans.filter(p => p.status === 'open').map((p, i) => [p.id, planId(seedLeafId, i)]));
 
   // 合并历史摘要(窗口之前的剧情) = 种子叶子 text
   const mergedSummary = renderHistoryNodes(selectHistoryNodesBefore(memory.summaries, sourceChat, carryStart));
@@ -283,7 +295,7 @@ export async function createNewChatWithCarryover(): Promise<boolean> {
     const m = sourceChat[i];
     if (!m) continue;
     if (m.is_system && m.extra?.type) continue; // 原生系统楼不搬
-    carryMessages.push(sanitizeCarryMessage(m, detailIds));
+    carryMessages.push(sanitizeCarryMessage(m, detailIds, planIds));
   }
 
   if (!mergedSummary && !carryMessages.length && !deltaHasData(seedDelta)) {

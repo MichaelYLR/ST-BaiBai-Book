@@ -9,7 +9,6 @@ import {
   buildSummaryPrompt,
   buildSummaryThinking,
   buildWorldInfoSystem,
-  CONDITION_PATCH_PROTOCOL,
   JAILBREAK_PROMPT,
   isBuiltinSummaryPrompt,
   LEDGER_PROTOCOL,
@@ -84,11 +83,9 @@ describe('new built-in prompts', () => {
     expect(system).toContain('【空间事实边界】');
     expect(system).toContain('【摘要时间语言铁律】');
     expect(system).toContain('【摘要撰写规则】(summary 字段,必填)');
-    // 新协议:伤情局部更新由代码动态注入
-    expect(system).toContain('【伤情局部更新协议】');
-    expect(system).toContain('conditionPatch');
-    expect(CONDITION_PATCH_PROTOCOL).toContain('未列入 replace 的旧片段由程序原样保留');
-    expect(CONDITION_PATCH_PROTOCOL).toContain('编号仅本请求有效');
+    // 伤情编号协议已停用:状态改回与着装相同的全文覆盖
+    expect(system).not.toContain('【伤情局部更新协议】');
+    expect(system).not.toContain('conditionPatch');
     expect(NPC_LOCATION_EVIDENCE_PROTOCOL).toContain('locationEvidence');
     expect(LEDGER_PROTOCOL).toContain('bbs_items');
   });
@@ -148,7 +145,7 @@ describe('new built-in prompts', () => {
     expect(combined(parts)).not.toContain(SUMMARY_OUTPUT_PROTOCOL);
     expect(THINKING_CHECKLIST).toContain(SUMMARY_OUTPUT_PROTOCOL);
     expect(THINKING_CHECKLIST).toContain('【输出前核查】');
-    expect(THINKING_CHECKLIST).toContain('conditionPatch');
+    expect(THINKING_CHECKLIST).not.toContain('conditionPatch');
     expect(buildSummaryThinking(args.user)).toContain(args.user);
     expect(RESUMMARY_THINKING_CHECKLIST).toContain(SUMMARY_OUTPUT_PROTOCOL);
     expect(RESUMMARY_THINKING_CHECKLIST).toContain('根键只有 summary');

@@ -8,7 +8,7 @@ import { memory, recomputeDerived, saveMemory, scheduleLeafFlush } from './store
 import { readItemsTagText, writeItemLogTag, writeVarLogTag } from './timeTag';
 import { scheduleVectorIndex } from './vector';
 import { invalidateRecallCache } from './vector/cache';
-import { applyConditionPatch, hasConditionPatchContent } from './conditionPatch';
+import { applyConditionPatch, hasConditionPatchContent, stripConditionFragmentIds } from './conditionPatch';
 import { createEmptyMemory } from './types';
 import type { BaibaiMemory, ConditionPatch, ConditionPatchOp, ItemDelta, ItemLogEntry, JsonValue, LeafExtra, LifeDetailAdd, LifeDetailUpdate, MemLifeDetail, MemNpc, MemPlan, MemScene, MemSummary, NpcAffinity, NpcDelta, NpcPresence, PlanResolveItem, PlanUpdateItem, ProtagonistDelta, SceneDelta, SceneFocus, SceneOp, SceneReparent, StoredDelta, SummaryDelta, VarOp, VarTemplate, VarTier } from './types';
 
@@ -170,18 +170,15 @@ function cleanSceneOpList(v: unknown): SceneOp[] {
 }
 
 /**
- * 清洗伤情局部补丁。replace 条目必须带合法片段编号(c1/c2…);text 允许空字符串(=删除该片段);
- * add 条目必须有非空 text。evidence 仅作解析校验,入库前剥离。
+ * 旧存档(v0.17 编号协议)里的伤情补丁,仅供重放。入库时已被当年的清洗器洗过:
+ * 编号都是小写 cN、text 都是字符串(空串=删该片段),这里只做形状校验。
  */
 function cleanConditionPatchOp(raw: unknown, requireId: boolean): ConditionPatchOp | null {
-  if (!isRecord(raw)) return null;
-  const id = typeof raw.id === 'string' ? raw.id.trim() : '';
-  if (requireId && !/^c\d+$/i.test(id)) return null;
-  const text = typeof raw.text === 'string' ? raw.text.trim() : '';
-  if (!requireId && !text) return null;
-  const out: ConditionPatchOp = { text };
-  if (requireId) out.id = id.toLowerCase();
-  return out;
+  if (!isRecord(raw) || typeof raw.text !== 'string') return null;
+  const text = raw.text.trim();
+  if (!requireId) return text ? { text } : null;
+  const id = typeof raw.id === 'string' ? raw.id.trim().toLowerCase() : '';
+  return /^c\d+$/.test(id) ? { id, text } : null;
 }
 
 function cleanConditionPatch(raw: unknown): ConditionPatch | undefined {
@@ -193,6 +190,12 @@ function cleanConditionPatch(raw: unknown): ConditionPatch | undefined {
   if (replace.length) out.replace = replace;
   if (add.length) out.add = add;
   return out;
+}
+
+/** condition 全文:剥掉旧存档里抄进去的 `[cN]` 编号;省略=undefined、空串=清空的语义不变。 */
+function cleanConditionText(v: unknown): string | undefined {
+  const text = patchText(v);
+  return text === undefined ? undefined : stripConditionFragmentIds(text);
 }
 
 /**
@@ -209,15 +212,19 @@ export interface LocationEvidenceGuard {
   enforce: boolean;
 }
 
-/** 证据是否可核:优先原样子串匹配;容忍空白差异;过短(单字/标点)不算有效定位短句。 */
-function evidenceMatches(content: string, quote: string): boolean {
-  const q = quote.replace(/\s+/g, '');
-  if (q.length < 4) return false;
-  if (content.includes(quote)) return true;
-  return content.replace(/\s+/g, '').includes(q);
+/** 证据比对前的归一:统一全半角,忽略空白与标点差异(模型常把「,」抄成「，」、丢掉引号)。 */
+function normEvidence(s: string): string {
+  return s.normalize('NFKC').replace(/[\s\p{P}\p{S}]+/gu, '');
 }
 
-function cleanNpcDelta(raw: unknown, guard?: LocationEvidenceGuard): NpcDelta | null {
+/** 证据是否可核:归一后做子串匹配;过短(单字/标点)不算有效定位短句。 */
+function evidenceMatches(content: string, quote: string): boolean {
+  const q = normEvidence(quote);
+  if (q.length < 4) return false;
+  return normEvidence(content).includes(q);
+}
+
+function cleanNpcDelta(raw: unknown, guard?: LocationEvidenceGuard, legacyPatch = false): NpcDelta | null {
   if (!isRecord(raw)) {
     const name = scalarText(raw);
     return name ? { name } : null;
@@ -225,6 +232,7 @@ function cleanNpcDelta(raw: unknown, guard?: LocationEvidenceGuard): NpcDelta | 
   const name = namedText(raw, ['name', 'npc', 'id']);
   if (!name) return null;
   const conditionPatch = cleanConditionPatch(raw.conditionPatch);
+  const condition = cleanConditionText(raw.condition);
   const location = patchText(raw.location);
   // 非空 location 必须有可核对的本轮原文证据(仅内置提示词启用;空串=清除,不需证据)。
   let keptLocation = location;
@@ -251,20 +259,22 @@ function cleanNpcDelta(raw: unknown, guard?: LocationEvidenceGuard): NpcDelta | 
     // 即时层(覆盖型快照)用 patchText:省略=保持旧值,空字符串=明确清空(痊愈/脱下)。
     // 与 cleanProtagonistDelta 同语义;optText 会把空串洗成 undefined,导致永远无法清空。
     outfit: patchText(raw.outfit),
-    condition: patchText(raw.condition),
+    condition,
     important: optBool(raw.important),
     follow: optBool(raw.follow),
     // 同 outfit/condition 的补丁语义:省略=保持旧值,空字符串=明确清空(离场且去向未明 → 所在不明)。
     // 此前用 optText 会把空串洗成 undefined,导致 AI 无法清掉旧地点、离场后仍被判为在场。
     location: keptLocation,
   };
-  if (conditionPatch) out.conditionPatch = conditionPatch;
+  // 伤情补丁只认旧存档(重放时 legacyPatch=true);新输出已改回全文覆盖,模型再给补丁也不收,
+  // 免得原样入库后编号随前面楼层变动而错位。全文与补丁同给时以全文为准(补丁编号对应的是旧片段)。
+  if (legacyPatch && conditionPatch && condition === undefined) out.conditionPatch = conditionPatch;
   // locationEvidence 仅在上面用于校验,不进入持久化 delta。
   return out;
 }
 
-function cleanNpcList(v: unknown, guard?: LocationEvidenceGuard): NpcDelta[] {
-  return arr(v).map(x => cleanNpcDelta(x, guard)).filter((x): x is NpcDelta => !!x);
+function cleanNpcList(v: unknown, guard?: LocationEvidenceGuard, legacyPatch = false): NpcDelta[] {
+  return arr(v).map(x => cleanNpcDelta(x, guard, legacyPatch)).filter((x): x is NpcDelta => !!x);
 }
 
 /**
@@ -331,15 +341,18 @@ function cleanLifeDetailUpdateList(v: unknown): (LifeDetailUpdate & { tier?: 'pi
   return arr(v).map(cleanLifeDetailUpdate).filter((x): x is LifeDetailUpdate & { tier?: 'pinned' | 'active' | 'archive' } => !!x);
 }
 
-function cleanProtagonistDelta(raw: unknown): ProtagonistDelta | null {
+function cleanProtagonistDelta(raw: unknown, legacyPatch = false): ProtagonistDelta | null {
   if (!isRecord(raw)) return null;
   const out: ProtagonistDelta = {};
-  for (const key of ['gender', 'age', 'ageTime', 'identity', 'appearance', 'outfit', 'condition'] as const) {
+  for (const key of ['gender', 'age', 'ageTime', 'identity', 'appearance', 'outfit'] as const) {
     const value = patchText(raw[key]);
     if (value !== undefined) out[key] = value;
   }
+  const condition = cleanConditionText(raw.condition);
+  if (condition !== undefined) out.condition = condition;
+  // 伤情补丁只认旧存档、全文优先,理由同 cleanNpcDelta。
   const conditionPatch = cleanConditionPatch(raw.conditionPatch);
-  if (conditionPatch) out.conditionPatch = conditionPatch;
+  if (legacyPatch && conditionPatch && condition === undefined) out.conditionPatch = conditionPatch;
   return Object.keys(out).length ? out : null;
 }
 
@@ -407,7 +420,7 @@ function cleanStoredDelta(raw: StoredDelta): StoredDelta {
   if (raw.locationPath !== undefined) out.locationPath = locationPath;
   const sceneFocus = cleanSceneFocus(raw.sceneFocus);
   if (sceneFocus !== undefined) out.sceneFocus = sceneFocus;
-  const protagonist = cleanProtagonistDelta(raw.protagonist);
+  const protagonist = cleanProtagonistDelta(raw.protagonist, true);
   if (protagonist) out.protagonist = protagonist;
 
   if (isRecord(raw.items)) {
@@ -438,8 +451,8 @@ function cleanStoredDelta(raw: StoredDelta): StoredDelta {
 
   if (isRecord(raw.npcs)) {
     const npcs: NonNullable<StoredDelta['npcs']> = {};
-    const add = cleanNpcList(raw.npcs.add);
-    const update = cleanNpcList(raw.npcs.update);
+    const add = cleanNpcList(raw.npcs.add, undefined, true);
+    const update = cleanNpcList(raw.npcs.update, undefined, true);
     const remove = cleanTextList(raw.npcs.remove, ['name', 'npc', 'id']);
     if (add.length) npcs.add = add;
     if (update.length) npcs.update = update;
@@ -839,7 +852,7 @@ function applyNpcPlacement(n: { follow?: boolean; location?: string }, src: NpcD
 function applyNpcState(n: { outfit?: string; condition?: string; important?: boolean }, src: NpcDelta): void {
   if (typeof src.outfit === 'string') n.outfit = src.outfit.trim() || undefined;
   if (typeof src.condition === 'string') n.condition = src.condition.trim() || undefined;
-  // 伤情局部更新:未列入 replace 的旧片段保留,不会自动回血。
+  // 旧存档的伤情补丁:未列入 replace 的旧片段保留(新输出已改回全文覆盖)。
   if (src.conditionPatch && hasConditionPatchContent(src.conditionPatch)) {
     n.condition = applyConditionPatch(n.condition, src.conditionPatch);
   }
@@ -867,7 +880,7 @@ function applyProtagonistState(target: BaibaiMemory['protagonist'], src: Protago
   for (const key of ['gender', 'identity', 'appearance', 'outfit', 'condition'] as const) {
     if (typeof src[key] === 'string') target[key] = src[key]!.trim() || undefined;
   }
-  // 伤情局部更新:已有非空伤情时模型改用 conditionPatch,只改指定片段。
+  // 旧存档的伤情补丁:只改指定片段(新输出已改回全文覆盖)。
   if (src.conditionPatch && hasConditionPatchContent(src.conditionPatch)) {
     target.condition = applyConditionPatch(target.condition, src.conditionPatch);
   }
@@ -1685,8 +1698,12 @@ export function finalizeDelta(delta: SummaryDelta, openPlansOrdered: { id: strin
   const location = optText(delta.location);
   if (time) out.time = time;
   if (location) out.location = location;
-  // 权威定位路径:AI 显式给 [] 表示「无法对应已知节点」→ 清除旧锚点,而不是保留旧归属。
-  if (delta.locationPath !== undefined) out.locationPath = cleanPath(delta.locationPath);
+  // 权威定位路径:随 location 一起显式给 [] 表示「无法对应已知节点」→ 清除旧锚点,而不是保留旧归属。
+  // 单独出现的 null/""/[] 不算清除:模型常把未用字段写成空值,锚点一丢,NPC 在场判定就退回模糊匹配。
+  if (delta.locationPath != null) {
+    const lp = cleanPath(delta.locationPath);
+    if (lp.length || (location && Array.isArray(delta.locationPath))) out.locationPath = lp;
+  }
   const sceneFocus = cleanSceneFocus(delta.sceneFocus);
   if (sceneFocus !== undefined) out.sceneFocus = sceneFocus;
   const protagonist = cleanProtagonistDelta(delta.protagonist);
@@ -1936,9 +1953,14 @@ export function appendOpToLatestLeaf(op: StoredDelta): boolean {
     if (op.scenes.ops?.length) (ds.ops ??= []).push(...op.scenes.ops);
   }
   if (op.plans) {
-    if (op.plans.add?.length || op.plans.resolve?.length || op.plans.remove?.length || op.plans.reopen?.length) changed = true;
+    if (op.plans.add?.length || op.plans.resolve?.length || op.plans.remove?.length || op.plans.reopen?.length || op.plans.update?.length) changed = true;
     const dp = (d.plans ??= {});
     if (op.plans.add?.length) (dp.add ??= []).push(...op.plans.add);
+    for (const u of op.plans.update ?? []) {
+      // 同叶子内按 id 合并:先改内容再改期限时,后一次不能把前一次冲掉
+      const prev = dp.update?.find(x => x.id === u.id);
+      dp.update = [...(dp.update ?? []).filter(x => x.id !== u.id), { ...prev, ...u }];
+    }
     for (const r of op.plans.resolve ?? []) {
       const rid = resolveEntryId(r);
       dp.reopen = (dp.reopen ?? []).filter(x => x !== rid); // 互斥
@@ -2366,6 +2388,12 @@ export function editPlan(
 
   chat[index].extra = { ...(chat[index].extra ?? {}), bbs_leaf: leaf };
   recomputeDerived();
+  // 后续楼层 AI 的 plans.update 重放时会盖掉原地修改;真被盖掉了才在最新叶子追加一条 update 兜住
+  const cur = memory.plans.find(p => p.id === planIdStr);
+  const update: PlanUpdateItem = { id: planIdStr };
+  if (cur && add.content && cur.content !== add.content) update.content = add.content;
+  if (cur && patch.targetTime !== undefined && (cur.targetTime ?? '') !== (add.targetTime ?? '')) update.targetTime = add.targetTime ?? '';
+  if ((update.content !== undefined || update.targetTime !== undefined) && appendOpToLatestLeaf({ plans: { update: [update] } })) return true;
   scheduleLeafFlush();
   return true;
 }

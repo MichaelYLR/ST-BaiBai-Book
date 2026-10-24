@@ -15,7 +15,6 @@
  */
 
 import { apiSettings, type Verbosity } from '@/api/settings';
-import { fmtConditionFragments } from './conditionPatch';
 import { fmtLifeDetail } from './lifeDetails';
 import { fmtNpcSummaryList, NPC_AFFINITY_FIELDS, type NpcSummaryView } from './npcRelations';
 import { RULE_COMPLETE_TIME_ANCHOR } from './timeTag';
@@ -73,8 +72,6 @@ const SUMMARY_SPLIT = splitPrompt(SUMMARY_BODY);
 const RESUMMARY_SPLIT = splitPrompt(RESUMMARY_BODY);
 const RESUMMARY2_SPLIT = splitPrompt(RESUMMARY2_BODY);
 
-/** 伤情局部更新协议(08 内置;片段编号由请求动态附加)。 */
-export const CONDITION_PATCH_PROTOCOL = protocolSection('CONDITION_PATCH_PROTOCOL');
 /** NPC 定位证据协议(08 内置)。 */
 export const NPC_LOCATION_EVIDENCE_PROTOCOL = protocolSection('NPC_LOCATION_EVIDENCE_PROTOCOL');
 /** 旁注读取协议(注入主对话,提醒主模型不要复写 <bbs_items>/<bbs_vars>)。 */
@@ -241,58 +238,6 @@ ${NPC_AFFINITY_FIELDS.map(f => `  ${f.label}(${f.key}):${f.options.filter(o => o
 【输出示例】若原内=1、外=-1,本轮重要事件支持内在升到2而仍掩饰,只写 {"name":"原角色名","affinityInner":2,"affinityNote":"估计更加在意,仍以冷淡掩饰关心"};外在不重复写。若只是普通互动,两侧与说明均省略。
 【分工与视角】relation 保留关系称谓与可观察立场,ties 保留长期人际结构;内置好感不写入自定义变量,不要据此新建或同步同名变量(用户已有变量仅按其原规则独立处理)。内在估计不代表主角或其他角色知情,不可让人读心、揭穿秘密或自动表白。`;
 
-/** NPC 规则(npcs 字段)。 */
-export const RULE_NPCS = `═══ 【NPC 规则】(npcs 字段,极严筛选) ═══
-{{user}} 本人不放进 NPC 名册;其变化写入 protagonist。NPC **默认不记**,门槛比物品更高 —— 宁可漏记,也绝不滥记;绝大多数楼层不产生任何 npcs.add。
-━━ 准入硬门槛(必须满足其一,否则一律不记) ━━
-  ① 该角色与 {{user}} 发生过**直接、具体且有剧情意义的互动**:有来有往的对话、冲突对抗、交易、结伴同行、情感往来、给予关键信息/物品等。一次性的服务性接触(点菜、问路、买东西、检票)**不算**互动。
-  ② 或:虽暂未露面,但被剧情**反复指涉、明显重要**的关键人物(如尚未现身的幕后主使、被反复提及的传说人物)。
-【反例 —— 一律不记(哪怕 AI 顺手给了名字)】店小二、跑堂、车夫船夫、摊贩商贩、路人甲乙、围观群众、群演、报幕/通报/喊话者、只露一面就消失的功能性角色、仅被瞥见或一笔带过的人。这些都不满足"与主角直接且有意义地互动"。
-【判据】问两句:"主角和这人之间发生了具体的、对剧情有影响的事吗?""这人离开后,后续剧情还会需要记得他是谁吗?"——两句都明确为"是"才记;只要一句拿不准 → **不记**。
-【字段】每个 NPC 可带档案层、即时层及独立的好感估计,更新门槛不同:
-  ┃ 档案层(他是谁/长什么样,长期不变,高门槛,几乎不更新):
-  ✦ gender:**性别**(短值,如「男」「女」)——记一次即可。**极重要**:性别在所有分档都注入(包括不在场),防你在后续剧情搞错该角色性别。首次记录时务必填,除非正文确实未透露。
-  ✦ age:**年龄**——在正文**明确**提到时记(自报、被介绍、文档写明),写正文原话的值(「25」「二十出头」都行):名册里还没有年龄 → 补填;已有年龄 → 仅正文明确纠正/变化(过生日、改龄)才 update。**绝不要按时间流逝自己换算年龄**:系统会记下此刻的故事时间作锚点、以后随剧情时间自动推算;你若隔三差五重写一遍,反而把锚点刷乱。正文没提就不填,禁止按外貌猜。
-  ✦ relation:**与主角({{user}})的关系**(覆盖型)——格式「称谓,一句态度/立场」,**称谓写在最前**(如「主角的师姐,明面冷淡暗中维护」)。首次记录互动角色时尽量填。
-    【质变的证据门槛(极重要)】update relation 只认三种证据:人物**明确说出**(公开断绝、当面告白定情)、双方**明确约定**(结盟、拜师、成婚),或**无歧义的客观事件**(一方杀了对方至亲、正式退婚)。
-    ✗ 单次争吵、冷战、赌气离开、一次亲密举动、送礼、照顾、短暂分离,**都不构成质变**——relation 保持不动,把事件写进 summary 即可。典型错误:「吵了一架」写成「已彻底决裂」、「和好前先写了『已和好』」——**严禁**。
-    ✗ 态度半句只写可观察事实(「近日因 X 事争吵,表面冷淡」),不下心理结论(「深爱」「恨之入骨」正文没明说就不能写)。
-    ✦ update 时**称谓部分保持不变**(师姐吵架了还是师姐),通常只更新态度半句;称谓本身变了(结拜、成婚、相认)才连称谓一起改。
-  ✦ ties:**与其他角色的重要关系**(高门槛)——只记长期结构性关系(血缘/婚姻/主仆/宿敌),一句话并列(如「阿黛尔之父;与镇长有旧怨」)。普通认识不记;对主角的内心好感与外在态度走 affinityInner/affinityOuter/affinityNote,不写 ties,不再新建对应的自定义变量。update 是整体覆盖,写累积后的完整内容;质变证据门槛与 relation 同。
-  ✦ title:身份/职业一句话(如「归雁客栈掌柜」「主角的青梅竹马」)——**最重要**,这是该 NPC 不在场时仍会保留的核心身份信息。
-  ✦ desc:**固定外貌**——只写发色、身材、五官、疤痕、惯常气质等**长期不变**的体貌特征,**不要写当下穿什么**(那是 outfit)。
-  ✦ personality:性格(简短,如「沉默寡言、护短」)。
-  ✦ 写不出 title 的角色基本没有记录价值,倾向不记。
-${RULE_NPC_AFFINITY}
-  ┃ 即时层(他现在怎么样,会变,覆盖型,鼓励跟剧情刷新):
-  ✦ outfit:**当前着装**。与 desc 分离正是为了解决「角色一辈子不换衣服」——**门槛低**:正文一旦明确描写换装、更衣、衣物被弄脏/撕破/血染/打湿,就 update outfit 写出当前完整穿着。它是当前快照,不进历史,放心刷新。
-  ✦ condition:**当前状态/健康**(受伤、疲惫、中毒、醉酒、虚弱等);无异常时不写。同为覆盖型,状态一变就 update,痊愈了就更新或清空。
-【外貌(desc)与着装(outfit)铁律区分】「黑色长发、左眉有疤」→ desc(几乎不变);「今天穿红斗篷、佩长剑」→ outfit(随时可变)。绝不可把当下穿着写进 desc,否则又会被冻结。
-
-【主要角色(important)—— 核心主演的状态追踪】
-  ✦ 何为主要角色:在剧情里**反复出场、戏份吃重的核心主演**(常驻主角团、主线关键人物)。它们的身份/性格/外貌设定通常已在角色设定里,**无需你费笔墨记档案**。
-  ✦ 标记:认定某角色已成为主要角色 → 在其 add/update 里带 important:true。也可能由用户手动标记。
-  ✦ 主要角色永远全量发给后续剧情(不受在场与否影响),所以对它们**重点维护即时层**(outfit/condition/location),title 给一句帮定位即可,desc/personality 可省。
-  ✦ 不要滥标:绝大多数 NPC 是配角,important 省略即可;只有真正的核心主演才标。
-【随行 / 所在地(follow / location)—— 省 token 核心】只有「随行」或「在当前所在地」的 NPC 才会把完整信息发给后续剧情,其他地方的 NPC 只发名字+身份。
-  ✦ 定点(默认):NPC 待在某地点 → location 填那个地点(复用上方【当前地点】或正文地名原文),follow 省略即可。
-  ✦ 随行:NPC 作为同伴**跟随主角一起行动/赶路**(队友、随从、暂时同行者)→ follow:true(此时不必写 location,随主角移动;**也不要写 location:""**——空串只表示所在不明,不是“没有地点”)。
-  ✦ 移动 NPC:某 NPC 加入队伍同行 → update follow:true;同伴离队留在某地 → update follow:false + location 填留下的地点;NPC 自己从一地去了另一地 → update location 改成新地点。
-  ✦ 离场但去向未写明(正文只写告别/离开场景,没说要去哪)→ update follow:false + location 填空字符串 ""(表示所在不明,系统**不再**视为在场);绝不能保留旧地点冒充还在原处。**离队必须写 follow:false**:系统绝不会仅凭空 location 取消随行,只写 location:"" 仍按随行处理。之后正文说明去向时再 update location 填新地点;重新同行 → follow:true。
-  ✦ location 命名务必复用既有地名原文,否则系统无法判断 NPC 是否在场。
-  ✦ 首次记录某 NPC 时,通常正与其在当前地点互动 → location 填【当前地点】(除非正文明确该 NPC 是随行同伴)。
-【何时更新(update)】
-  ✦ **在场对账(每楼必过)**:名册每条带〔在场〕/〔同区域〕/〔不在场〕标记(系统按**本楼开始前**的状态算好)。逐条核对:标〔在场〕的角色本楼离开/告别/被留在原地而主角离开 → 必须更新 location 或 follow;标〔不在场〕的角色本楼归来/与主角同处 → 必须更新回在场(follow:true 或 location 填当前地点)。更新位置后,同步把 sceneFocus.participants 改成与实际在场名单一致(冲突以正文为准),不要两边各说各话。
-  ✦ 档案层(title/desc/personality):只在**发生实质变化**或**首次补全**时更新;普通互动、对话不更新。update 的 desc/title 是整体覆盖,要写累积后的完整内容,别丢旧要点。
-  ✦ 即时层(outfit/condition):门槛低,正文描写了换装/受伤/状态变化就 update,这是它存在的意义。
-  ✦ 清空语义:outfit/condition 省略=保持旧值;填空字符串=明确清空(伤势痊愈、状态恢复正常、不再描述当前着装时务必清空,不要让旧状态永久残留)。
-【主要角色的离场演变(唯一允许的合理推演,务必克制)】
-  ✦ 通常铁律是「只记正文明写的」。**唯一例外**:对**主要角色**的**即时层**(outfit/location/condition),当其与主角分开**已明显跨越时间**(隔了数日、一场长旅程、一次大事件)后再登场或被提及时,允许你**合理推演**其状态的自然演变并 update —— 例如多日未见多半已换装、可能已移动到别处、伤势已痊愈或恶化。
-  ✦ 目的:避免「两人分开两天重逢,对方还穿着分别时那套、伤还没好」这种僵化。
-  ✦ 严格边界:此推演**仅限主要角色、仅限 outfit/location/condition 三个覆盖型字段**;**绝不可**外溢到 summary 正文、items、计划,也不可用于普通配角——那些仍严格只记正文明写,禁止脑补。推演要符合常理、点到为止,不要编造具体剧情事件。
-【退场(remove)】NPC 永久退场(死亡、彻底离开剧情且不会再出现)才 remove;只是暂时分开、去了别处用 location/follow 表达,不要 remove。
-【复用已有,严禁重复】上方【已登场NPC】是已记录名册。同一角色务必复用既有名字,不要换个叫法再记一遍;已在名册里且无变化 → 不输出 npcs。`;
-
 /** 互动局势卡规则(sceneFocus 字段)。 */
 export const RULE_SCENE_FOCUS = `═══ 【互动局势卡规则】(sceneFocus 字段,覆盖型单对象) ═══
 它是「眼下正在发生什么」的一小张快照,帮写作 AI 衔接当下场面。整卡覆盖语义,默认不动:
@@ -455,7 +400,7 @@ ${RULE_ABSOLUTE_TIME_LANGUAGE}`;
 
 const SUMMARY_INPUT = SUMMARY_SPLIT.input;
 
-const SUMMARY_RULES = `${SUMMARY_SPLIT.rules}\n\n${CONDITION_PATCH_PROTOCOL}`;
+const SUMMARY_RULES = SUMMARY_SPLIT.rules;
 
 /** 设置页仍提供完整可编辑模板;发送时内置规范与材料分别展开,不解析正文中的标题。 */
 export const SUMMARY_PROMPT = SUMMARY_BODY;
@@ -664,8 +609,7 @@ export function fmtProtagonist(protagonist: MemProtagonist): string {
     ['身份', protagonist.identity],
     ['外貌', protagonist.appearance],
     ['着装', protagonist.outfit],
-    // 状态渲染成 [c1]/[c2] 编号片段,供 conditionPatch 按编号局部更新
-    ['状态', fmtConditionFragments(protagonist.condition)],
+    ['状态', protagonist.condition],
   ];
   const lines = rows
     .filter(([, value]) => oneLine(value))
