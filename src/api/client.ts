@@ -9,7 +9,7 @@ import type { ApiChannel } from './settings';
  * 因此没有浏览器 CORS 问题,也无需把密钥存进 ST 的 secrets。
  */
 
-const GENERATE_URL = '/api/backends/chat-completions/generate';
+export const GENERATE_URL = '/api/backends/chat-completions/generate';
 const DEFAULT_TIMEOUT_SEC = 180;
 
 export interface ChatMsg {

@@ -7,10 +7,11 @@ import { NPC_AFFINITY_FIELDS, affinityLevelFromInput, fmtNpcAffinity } from '@/m
 import ConfirmDialog from '@/components/ConfirmDialog.vue';
 import ModalMask from '@/components/ModalMask.vue';
 import SummaryOnlyNotice from '@/components/SummaryOnlyNotice.vue';
-import { classifyNpcPresence, editNpc, removeNpc, setNpcFollow, setNpcImportant, setProtagonist, upsertNpc, addLifeDetail, removeLifeDetail, updateLifeDetail } from '@/memory/apply';
+import { classifyNpcPresence, editNpc, removeNpc, setNpcFollow, setNpcImportant, setProtagonist, upsertNpc, addLifeDetail, removeLifeDetail, updateLifeDetail, addKnowledge, removeKnowledge, updateKnowledge } from '@/memory/apply';
+import { knowledgeOf, sameKnowledge } from '@/memory/knowledge';
 import { derivedMeta, memory } from '@/memory/store';
 import { ageDisplay } from '@/memory/timeRel';
-import type { MemLifeDetail, MemNpc } from '@/memory/types';
+import type { MemKnowledge, MemLifeDetail, MemNpc } from '@/memory/types';
 import { getContext } from '@/st/context';
 import { toast } from '@/st/toast';
 import { computed, nextTick, ref } from 'vue';
@@ -328,6 +329,67 @@ function confirmRemove() {
   if (removing.value) removeNpc(removing.value.name);
   removing.value = null;
 }
+
+/* —— 了解清单:角色知道/以为的主角的事(没记的私事 = 该角色不知道) —— */
+function knowCount(n: MemNpc): number {
+  return knowledgeOf(memory.knowledge, n.name).length;
+}
+function knowTitle(n: MemNpc): string {
+  const c = knowCount(n);
+  return `${n.name} 对主角的了解 · ${c ? `${c} 条` : '暂无记录'}`;
+}
+/** 卡片预览:最近两条、新的在前——行宽不够要截断时,先保住最新的认知 */
+function knowPreview(n: MemNpc): string {
+  return knowledgeOf(memory.knowledge, n.name).slice(-2).reverse().map(k => k.text).join(' / ');
+}
+const knowFor = ref<string | null>(null);
+const knowList = computed(() => (knowFor.value ? knowledgeOf(memory.knowledge, knowFor.value) : []));
+const knowDraft = ref('');
+const knowEditing = ref<{ id: string; text: string } | null>(null);
+function openKnow(n: MemNpc) {
+  knowFor.value = n.name;
+  knowDraft.value = '';
+  knowEditing.value = null;
+}
+function closeKnow() {
+  knowFor.value = null;
+  knowEditing.value = null;
+}
+// 同义条目重放时会被去重:先挡下,免得「点了保存却没变化/条目消失」
+function knowDuplicated(text: string, exceptId?: string): boolean {
+  const who = knowFor.value ?? '';
+  return knowList.value.some(k => k.id !== exceptId && sameKnowledge(k, { subject: who, text }));
+}
+function addKnow() {
+  const text = knowDraft.value.trim();
+  if (!knowFor.value || !text) return;
+  if (knowDuplicated(text)) {
+    toast('已有同样的条目', 'warning');
+    return;
+  }
+  if (addKnowledge(knowFor.value, text)) knowDraft.value = '';
+}
+function startKnowEdit(k: MemKnowledge) {
+  knowEditing.value = { id: k.id, text: k.text };
+}
+function saveKnowEdit() {
+  const e = knowEditing.value;
+  if (!e) return;
+  const text = e.text.trim();
+  if (text === knowList.value.find(k => k.id === e.id)?.text) {
+    knowEditing.value = null;
+    return;
+  }
+  if (knowDuplicated(text, e.id)) {
+    toast('已有同样的条目', 'warning');
+    return;
+  }
+  if (updateKnowledge(e.id, text)) knowEditing.value = null;
+}
+function deleteKnow(k: MemKnowledge) {
+  if (knowEditing.value?.id === k.id) knowEditing.value = null;
+  removeKnowledge(k.id);
+}
 </script>
 
 <template>
@@ -469,11 +531,12 @@ function confirmRemove() {
                 <span v-if="shownAge(n.age, n.ageTime)" class="bbs-npc-gender" :title="ageTitle(n.age, n.ageTime)">{{ shownAge(n.age, n.ageTime) }}</span>
                 <span class="bbs-npc-acts">
                   <button class="bbs-item-act bbs-npc-star active" type="button" title="主要角色 · 点击取消" @click="toggleImportant(n)"><Icon name="star" /></button>
+                  <button v-if="apiSettings.injection.knowledge || knowCount(n)" class="bbs-item-act" :class="{ active: knowCount(n) }" type="button" :title="knowTitle(n)" @click="openKnow(n)"><Icon name="bulb" /></button>
                   <button class="bbs-item-act" type="button" title="编辑" @click="openEdit(n)"><Icon name="edit" /></button>
                   <button class="bbs-item-act bbs-item-del" type="button" title="删除" @click="askRemove(n)"><Icon name="trash" /></button>
                 </span>
               </div>
-              <dl v-if="n.title || n.relation || fmtNpcAffinity(n) || n.outfit || n.condition || n.follow || n.location" class="bbs-npc-fields">
+              <dl v-if="n.title || n.relation || fmtNpcAffinity(n) || n.outfit || n.condition || n.follow || n.location || knowCount(n)" class="bbs-npc-fields">
                 <div v-if="n.title" class="bbs-npc-field f-title"><dt>身份</dt><dd>{{ n.title }}</dd></div>
                 <div v-if="n.relation" class="bbs-npc-field f-rel"><dt>关系</dt><dd>{{ n.relation }}</dd></div>
                 <div v-if="fmtNpcAffinity(n)" class="bbs-npc-field"><dt title="对主角的内心好感与外在态度估计">好感</dt><dd>{{ fmtNpcAffinity(n) }}</dd></div>
@@ -483,6 +546,7 @@ function confirmRemove() {
                 </div>
                 <div v-if="n.outfit" class="bbs-npc-field f-outfit"><dt>着装</dt><dd>{{ n.outfit }}</dd></div>
                 <div v-if="n.condition" class="bbs-npc-field f-cond"><dt>状态</dt><dd>{{ n.condition }}</dd></div>
+                <div v-if="knowCount(n)" class="bbs-npc-field f-know" :title="knowTitle(n)" @click="openKnow(n)"><dt>了解</dt><dd><span class="bbs-npc-know-text">{{ knowPreview(n) }}</span><span class="bbs-npc-know-count">{{ knowCount(n) }} 条</span></dd></div>
               </dl>
               <p v-else class="bbs-npc-mainhint">尚无状态记录 —— 编辑可补充当前着装 / 状态 / 所在。</p>
             </div>
@@ -523,11 +587,12 @@ function confirmRemove() {
                   >
                     <Icon name="pin" />
                   </button>
+                  <button v-if="apiSettings.injection.knowledge || knowCount(n)" class="bbs-item-act" :class="{ active: knowCount(n) }" type="button" :title="knowTitle(n)" @click="openKnow(n)"><Icon name="bulb" /></button>
                   <button class="bbs-item-act" type="button" title="编辑" @click="openEdit(n)"><Icon name="edit" /></button>
                   <button class="bbs-item-act bbs-item-del" type="button" title="删除" @click="askRemove(n)"><Icon name="trash" /></button>
                 </span>
               </div>
-              <dl v-if="n.title || n.relation || fmtNpcAffinity(n) || n.ties || n.personality || n.desc || n.outfit || n.condition || n.follow || n.location" class="bbs-npc-fields">
+              <dl v-if="n.title || n.relation || fmtNpcAffinity(n) || n.ties || n.personality || n.desc || n.outfit || n.condition || n.follow || n.location || knowCount(n)" class="bbs-npc-fields">
                 <div v-if="n.title" class="bbs-npc-field f-title"><dt>身份</dt><dd>{{ n.title }}</dd></div>
                 <div v-if="n.relation" class="bbs-npc-field f-rel"><dt>关系</dt><dd>{{ n.relation }}</dd></div>
                 <div v-if="fmtNpcAffinity(n)" class="bbs-npc-field"><dt title="对主角的内心好感与外在态度估计">好感</dt><dd>{{ fmtNpcAffinity(n) }}</dd></div>
@@ -540,6 +605,7 @@ function confirmRemove() {
                 <div v-if="n.personality" class="bbs-npc-field f-trait"><dt>性格</dt><dd>{{ n.personality }}</dd></div>
                 <div v-if="n.desc" class="bbs-npc-field f-desc"><dt>外貌</dt><dd>{{ n.desc }}</dd></div>
                 <div v-if="n.ties" class="bbs-npc-field f-ties"><dt>人际</dt><dd>{{ n.ties }}</dd></div>
+                <div v-if="knowCount(n)" class="bbs-npc-field f-know" :title="knowTitle(n)" @click="openKnow(n)"><dt>了解</dt><dd><span class="bbs-npc-know-text">{{ knowPreview(n) }}</span><span class="bbs-npc-know-count">{{ knowCount(n) }} 条</span></dd></div>
               </dl>
             </div>
           </article>
@@ -578,16 +644,18 @@ function confirmRemove() {
                   >
                     <Icon name="pin" />
                   </button>
+                  <button v-if="apiSettings.injection.knowledge || knowCount(n)" class="bbs-item-act" :class="{ active: knowCount(n) }" type="button" :title="knowTitle(n)" @click="openKnow(n)"><Icon name="bulb" /></button>
                   <button class="bbs-item-act" type="button" title="编辑" @click="openEdit(n)"><Icon name="edit" /></button>
                   <button class="bbs-item-act bbs-item-del" type="button" title="删除" @click="askRemove(n)"><Icon name="trash" /></button>
                 </span>
               </div>
-              <dl v-if="n.title || n.relation || fmtNpcAffinity(n) || n.personality || n.location" class="bbs-npc-fields">
+              <dl v-if="n.title || n.relation || fmtNpcAffinity(n) || n.personality || n.location || knowCount(n)" class="bbs-npc-fields">
                 <div v-if="n.title" class="bbs-npc-field f-title"><dt>身份</dt><dd>{{ n.title }}</dd></div>
                 <div v-if="n.relation" class="bbs-npc-field f-rel"><dt>关系</dt><dd>{{ n.relation }}</dd></div>
                 <div v-if="fmtNpcAffinity(n)" class="bbs-npc-field"><dt title="对主角的内心好感与外在态度估计">好感</dt><dd>{{ fmtNpcAffinity(n) }}</dd></div>
                 <div v-if="n.location" class="bbs-npc-field f-loc"><dt>所在</dt><dd>{{ n.location }}</dd></div>
                 <div v-if="n.personality" class="bbs-npc-field f-trait"><dt>性格</dt><dd>{{ n.personality }}</dd></div>
+                <div v-if="knowCount(n)" class="bbs-npc-field f-know" :title="knowTitle(n)" @click="openKnow(n)"><dt>了解</dt><dd><span class="bbs-npc-know-text">{{ knowPreview(n) }}</span><span class="bbs-npc-know-count">{{ knowCount(n) }} 条</span></dd></div>
               </dl>
             </div>
           </article>
@@ -626,6 +694,7 @@ function confirmRemove() {
                   >
                     <Icon name="pin" />
                   </button>
+                  <button v-if="apiSettings.injection.knowledge || knowCount(n)" class="bbs-item-act" :class="{ active: knowCount(n) }" type="button" :title="knowTitle(n)" @click="openKnow(n)"><Icon name="bulb" /></button>
                   <button class="bbs-item-act" type="button" title="编辑" @click="openEdit(n)"><Icon name="edit" /></button>
                   <button class="bbs-item-act bbs-item-del" type="button" title="删除" @click="askRemove(n)"><Icon name="trash" /></button>
                 </span>
@@ -639,6 +708,7 @@ function confirmRemove() {
                   <dd v-if="n.location">{{ n.location }}</dd>
                   <dd v-else class="is-nowhere">所在不明</dd>
                 </div>
+                <div v-if="knowCount(n)" class="bbs-npc-field f-know" :title="knowTitle(n)" @click="openKnow(n)"><dt>了解</dt><dd><span class="bbs-npc-know-text">{{ knowPreview(n) }}</span><span class="bbs-npc-know-count">{{ knowCount(n) }} 条</span></dd></div>
               </dl>
             </div>
           </article>
@@ -870,6 +940,51 @@ function confirmRemove() {
         <footer class="bbs-modal-foot">
           <button class="bbs-btn" type="button" @click="cancelEdit">取消</button>
           <button class="bbs-btn bbs-btn-primary" type="button" :disabled="!editing.name.trim()" @click="saveEdit">保存</button>
+        </footer>
+      </div>
+    </ModalMask>
+
+    <!-- 了解清单弹窗:看/改某角色知道或以为的主角的事 -->
+    <ModalMask :open="!!knowFor" @close="closeKnow">
+      <div v-if="knowFor" class="bbs-modal" role="dialog" aria-modal="true" aria-label="角色对主角的了解">
+        <header class="bbs-modal-head">
+          <span class="bbs-modal-title">{{ knowFor }} 对{{ protagonistName }}的了解</span>
+          <button class="bbs-item-act" type="button" title="关闭" @click="closeKnow"><Icon name="close" /></button>
+        </header>
+        <p class="bbs-know-hint">只记该角色亲耳听到、亲眼看到或听人说起的事。没记的私事(身世、经历、秘密、喜好、名字)默认该角色不知道;条目是角色自己以为的,被骗了就照记被骗后的认知。</p>
+        <ul v-if="knowList.length" class="bbs-know-list">
+          <li v-for="k in knowList" :key="k.id" class="bbs-know-row">
+            <template v-if="knowEditing?.id === k.id">
+              <textarea v-model="knowEditing.text" v-autosize class="bbs-input bbs-modal-textarea bbs-modal-autogrow" rows="1" aria-label="编辑了解条目"></textarea>
+              <span class="bbs-know-acts">
+                <button class="bbs-btn" type="button" @click="knowEditing = null">取消</button>
+                <button class="bbs-btn bbs-btn-primary" type="button" :disabled="!knowEditing.text.trim()" @click="saveKnowEdit">保存</button>
+              </span>
+            </template>
+            <template v-else>
+              <span class="bbs-know-text">{{ k.text }}</span>
+              <span class="bbs-know-acts">
+                <button class="bbs-item-act" type="button" title="编辑" @click="startKnowEdit(k)"><Icon name="edit" /></button>
+                <button class="bbs-item-act bbs-item-del" type="button" title="删除" @click="deleteKnow(k)"><Icon name="trash" /></button>
+              </span>
+            </template>
+          </li>
+        </ul>
+        <p v-else class="bbs-know-hint">暂无记录:剧情里没交代过的主角私事,该角色默认不知道。老相识早就知道的事,可以在下面手动补上。</p>
+        <label class="bbs-modal-field">
+          <span class="bbs-modal-label">添加一条</span>
+          <textarea
+            v-model="knowDraft"
+            v-autosize
+            class="bbs-input bbs-modal-textarea bbs-modal-autogrow"
+            rows="1"
+            :disabled="!hasLeaf"
+            :placeholder="hasLeaf ? '如:认定主角是行商 / 怀疑主角在隐瞒身世 / 不知道主角是王子' : '需先有摘要才能手动添加'"
+          ></textarea>
+        </label>
+        <footer class="bbs-modal-foot">
+          <button class="bbs-btn" type="button" @click="closeKnow">关闭</button>
+          <button class="bbs-btn bbs-btn-primary" type="button" :disabled="!hasLeaf || !knowDraft.trim()" @click="addKnow">添加</button>
         </footer>
       </div>
     </ModalMask>
@@ -1163,6 +1278,30 @@ function confirmRemove() {
   font-style: italic;
   opacity: 0.7;
 }
+/* 了解:只预览最近两条、单行截断,条数钉在行尾不被截掉;整行点开看全部——让人知道记了什么,又不把卡片撑高 */
+.bbs-npc-field.f-know {
+  cursor: pointer;
+}
+.bbs-npc-field.f-know dd {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.bbs-npc-know-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.bbs-npc-know-count {
+  flex: none;
+  font-size: 11px;
+  color: var(--bbs-ink-muted);
+}
+.bbs-npc-field.f-know:hover .bbs-npc-know-text {
+  color: var(--bbs-accent);
+}
 
 /* 主要角色无状态时的占位提示:引导补录当前状态,避免空卡 */
 .bbs-npc-mainhint {
@@ -1220,6 +1359,49 @@ function confirmRemove() {
 .bbs-npc-star.active:hover {
   color: var(--bbs-accent);
   background: var(--bbs-accent-soft);
+}
+/* 了解清单弹窗:条目行 = 正文 + 行尾操作;条目多时列表内滚动,添加框始终可见 */
+.bbs-know-hint {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--bbs-ink-muted);
+}
+.bbs-know-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  max-height: 40vh;
+  overflow-y: auto;
+}
+.bbs-know-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 4px 4px 4px 10px;
+  border-radius: var(--bbs-radius-sm);
+  background: var(--bbs-surface-2);
+}
+.bbs-know-row textarea {
+  flex: 1;
+  min-width: 0;
+}
+.bbs-know-text {
+  flex: 1;
+  min-width: 0;
+  padding-top: 4px;
+  font-size: 13px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.bbs-know-acts {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
 }
 /* 主要角色卡的操作区常驻(置顶组无需 hover 才显,星标本身就是状态指示) */
 .bbs-npc.is-main .bbs-npc-acts {

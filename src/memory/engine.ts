@@ -6,6 +6,7 @@ import type { STMessage, WorldInfoEntry } from '@/st/context';
 import { getContext, getCheckWorldInfo, getEjsTemplate, setMessageText } from '@/st/context';
 import { toast } from '@/st/toast';
 import { addSummary, classifyNpcPresence, deriveMemory, finalizeDelta, fmtVarOpsInline, getLeaf, invalidateSummaryAncestors, itemChangesOf, leafValid, makeLeafId, pruneBrokenComps, syncItemLogFromMessage, type LocationEvidenceGuard } from './apply';
+import { selectKnowledgeForSummary } from './knowledge';
 import { extractJsonObject } from './json';
 import { clearInjection, refreshInjection, renderHistoryNodes, selectHistoryNodesBefore } from './inject';
 import { buildBatchSummaryPrompt, buildBatchThinking, buildCharCardSystem, buildPersonaSystem, buildResummaryPrompt, buildSummaryPrompt, buildSummaryThinking, buildWorldInfoSystem, fmtItemLogInline, isBuiltinSummaryPrompt, JAILBREAK_PROMPT, RESUMMARY_THINKING_CHECKLIST, selectRecentResolvedPlans } from './prompts';
@@ -1072,6 +1073,7 @@ function applyLeafForFloor(
   stateBefore: ReturnType<typeof deriveMemory>,
   replaceLeaf?: LeafExtra,
   evidenceGuard?: LocationEvidenceGuard,
+  knowledgeShown?: { id: string }[],
 ): void {
   if (!chat[aiFloor]) {
     throw new Error(`摘要落叶失败:楼层 #${aiFloor} 已不存在(可能在请求期间被删除)`);
@@ -1085,7 +1087,9 @@ function applyLeafForFloor(
   // 未了结计划的有序列表:顺序即提示词里的 p1/p2…,用于把 resolve 短序号翻译成稳定 id
   const openPlansOrdered = stateBefore.plans.filter(p => p.status === 'open');
   // 生活小档案当前列表:顺序即提示词里的 d1/d2…,用于把 update/archive/remove 短序号翻译成稳定 id
-  const storedDelta = finalizeDelta(delta, openPlansOrdered, stateBefore.lifeDetails, evidenceGuard);
+  // 了解清单同理(k1/k2…);未传 knowledgeShown = 功能关闭,AI 输出的 knowledge 整段丢弃
+  const storedDelta = finalizeDelta(delta, openPlansOrdered, stateBefore.lifeDetails, evidenceGuard,
+    knowledgeShown && { shown: knowledgeShown, npcNames: stateBefore.npcs.map(n => n.name) });
 
   // 时间起止:标签优先(与新剧情同源不漂移);标签缺的那端用 AI 补的 timeStart/timeEnd 兜底。
   const timeStart = tag.start || llmOptionalScalar(delta.timeStart) || undefined;
@@ -1156,6 +1160,17 @@ async function summarizeFloorWork(
   const persona = fetchUserPersona();
 
   const openPlansOrdered = stateBefore.plans.filter(p => p.status === 'open');
+  // 了解清单只给相关角色(主要/在场/本轮正文点名),省 token;顺序即提示词里的 k1/k2…
+  // 点名只认两个字以上的名字:「林」「夏」这种单字名几乎每段正文都能命中
+  const knowledgeShown = apiSettings.injection.knowledge
+    ? selectKnowledgeForSummary(
+        stateBefore.knowledge,
+        stateBefore.npcs
+          .filter(n => n.important || (n.name.length >= 2 && content.includes(n.name))
+            || classifyNpcPresence(n, stateBefore.scenes, stateBefore.state.location, stateBefore.state.locationPath) === 'present')
+          .map(n => n.name),
+      )
+    : undefined;
   const prompt = buildSummaryPrompt({
     user: ctx.name1,
     char: ctx.name2,
@@ -1163,6 +1178,7 @@ async function summarizeFloorWork(
     location: stateBefore.state.location,
     sceneFocus: stateBefore.state.sceneFocus,
     lifeDetails: stateBefore.lifeDetails,
+    knowledge: knowledgeShown,
     protagonist: stateBefore.protagonist,
     items: stateBefore.items.map(i => ({ name: i.name, qty: i.qty, desc: i.desc, carried: i.carried, location: i.location })),
     itemLog: stateBefore.itemLog,
@@ -1205,7 +1221,7 @@ async function summarizeFloorWork(
     return { ...d, summary } as SummaryDelta & { summary: string };
   });
 
-  applyLeafForFloor(chat, aiFloor, delta, stateBefore, options.replaceLeaf, { content, enforce: isBuiltinSummaryPrompt() });
+  applyLeafForFloor(chat, aiFloor, delta, stateBefore, options.replaceLeaf, { content, enforce: isBuiltinSummaryPrompt() }, knowledgeShown);
   engineState.lastRunAt = Date.now();
 
   // 立刻反映到派生与注入;落盘走防抖(隐藏由收尾的 syncWindowHiddenState 统一负责)

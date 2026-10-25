@@ -15,6 +15,7 @@
 
 import type { STMessage } from '@/st/context';
 import { getContext } from '@/st/context';
+import { GENERATE_URL } from '@/api/client';
 import { apiSettings, resolveVectorModel } from '@/api/settings';
 import { deriveMemory, getLeaf, leafValid } from '../apply';
 import { resolveKeepStart } from '../engine';
@@ -148,14 +149,13 @@ function buildMessages(chat: STMessage[]): ChatMsg[] {
   return messages;
 }
 
-/** base url 规整到 /chat/completions 端点 */
-function chatCompletionsEndpoint(rawUrl: string): string {
-  const base = String(rawUrl || '')
+/** base url 规整:去掉 /embeddings、/chat/completions 尾巴(ST 代理会自己补 /chat/completions) */
+function chatBaseUrl(rawUrl: string): string {
+  return String(rawUrl || '')
     .trim()
     .replace(/\/+$/, '')
     .replace(/\/embeddings$/i, '')
     .replace(/\/chat\/completions$/i, '');
-  return base ? `${base}/chat/completions` : '';
 }
 
 /** 解析 INTENT + 多行 Q(对齐 Horae:去前缀符号、去重、限长) */
@@ -207,35 +207,43 @@ function sanitize(text: string, maxLen = MAX_QUERY_LEN): string {
 
 /**
  * 执行查询重写。queryRewrite 端点未配 model 时抛错(调用方降级)。
- * 走前端直连 chat/completions(与 embed 同源策略,渠道地址/密钥可留空复用 embedding)。
+ * 与副 API 一样走 ST 服务端转发(无跨域问题);渠道地址/密钥可留空复用 embedding。
  */
 export async function rewriteQuery(signal?: AbortSignal): Promise<RewriteResult> {
   const ep = resolveVectorModel('queryRewrite');
   if (!ep.model) throw new Error('Query 重写模型未配置');
-  const endpoint = chatCompletionsEndpoint(ep.url);
-  if (!endpoint) throw new Error('Query 重写地址未配置');
+  const baseUrl = chatBaseUrl(ep.url);
+  if (!baseUrl) throw new Error('Query 重写地址未配置');
 
   const ctx = getContext();
   const chat = ctx?.chat ?? [];
-  if (!chat.length) throw new Error('无对话上下文可重写');
+  if (!ctx || !chat.length) throw new Error('无对话上下文可重写');
 
   const messages = buildMessages(chat);
 
   const resp = await fetchWithTimeoutRetry(
-    endpoint,
+    GENERATE_URL,
     {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${ep.key || ''}` },
+      headers: ctx.getRequestHeaders(),
       body: JSON.stringify({
-        model: ep.model,
-        messages,
+        // 走 custom 源:openai 源只转发白名单字段,enable_thinking 会被 ST 丢掉;custom_include_body 原样并进上游请求体。
+        // custom 源不读 proxy_password,密钥靠 custom_include_headers 注入(覆盖 ST 自存的 Custom 密钥),
+        // 且一律 JSON.stringify 生成防 YAML 静默解析失败——两点详见 api/client.ts 的 buildRequestBody。
+        chat_completion_source: 'custom',
+        custom_url: baseUrl,
+        custom_include_headers: JSON.stringify({ Authorization: `Bearer ${ep.key || ''}` }),
         // 对齐 Horae:低温更服从格式;enable_thinking:false 关思维链——
         // 国产模型(Qwen3/GLM 等)默认开思维链会先吐 <think> 推理,冲乱 INTENT/Q 行格式导致解析失败。
+        custom_include_body: JSON.stringify({ enable_thinking: false }),
+        model: ep.model,
+        messages,
         temperature: 0.1,
         top_p: 0.8,
         max_tokens: apiSettings.vector.queryRewriteMaxTokens,
         stream: false,
-        enable_thinking: false,
+        // 防第三方 fetch 拦截器劫持 /generate 请求,同 buildRequestBody;ST 只在带 tools 时才转发它,到不了上游
+        tool_choice: 'none',
       }),
     },
     { timeoutSec: ep.timeoutSec, retries: ep.retries, label: 'Query 重写', externalSignal: signal },
@@ -245,6 +253,8 @@ export async function rewriteQuery(signal?: AbortSignal): Promise<RewriteResult>
     throw new Error(`Query 重写 API ${resp.status}: ${t.slice(0, 200)}`);
   }
   const json = await resp.json();
+  // ST 把上游报错包成 200 + { error }:上游 5xx/429 因此不再触发自动重试(超时/网络异常照旧重试)
+  if (json?.error) throw new Error(`Query 重写 API 错误:${json.error.message || '未知错误'}`);
   const content = json?.choices?.[0]?.message?.content;
   const raw = typeof content === 'string' ? content : '';
   if (!raw.trim()) throw new Error('Query 重写返回空内容');

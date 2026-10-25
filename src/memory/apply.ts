@@ -2,6 +2,7 @@ import { apiSettings } from '@/api/settings';
 import { getContext, setMessageText, type STMessage } from '@/st/context';
 import { fmtItemLogInline } from './prompts';
 import { lifeDetailSubject, mergeLifeDetailsOp, sameLifeDetail } from './lifeDetails';
+import { applyKnowledgeOps, cleanKnowledgeOps, finalizeKnowledge, knowledgeOf } from './knowledge';
 import { mergeProtagonistDelta } from './protagonist';
 import { applyNpcAffinity, cleanNpcAffinityLevel } from './npcRelations';
 import { memory, recomputeDerived, saveMemory, scheduleLeafFlush } from './store';
@@ -487,6 +488,9 @@ function cleanStoredDelta(raw: StoredDelta): StoredDelta {
     if (remove.length) lifeDetails.remove = remove;
     if (Object.keys(lifeDetails).length) out.lifeDetails = lifeDetails;
   }
+
+  const knowledge = cleanKnowledgeOps(raw.knowledge);
+  if (knowledge.length) out.knowledge = knowledge;
 
   const varOps = finalizeVarOps(raw.varOps);
   if (varOps.length) out.varOps = varOps;
@@ -1536,6 +1540,9 @@ function applyStoredDeltaTo(mem: BaibaiMemory, d: StoredDelta, leaf: { id: strin
     }
   }
 
+  // 了解清单:有序日志按原顺序施加,id 按操作序号确定,重放幂等
+  if (d.knowledge?.length) applyKnowledgeOps(mem.knowledge, d.knowledge, { id: leaf.id, createdAt: t, time: logTime });
+
   // 自定义变量:按顺序把本楼路径命令施加到 JSON 状态
   if (d.varOps?.length) applyVarOps(mem.vars, d.varOps);
 }
@@ -1549,11 +1556,11 @@ function applyStoredDeltaTo(mem: BaibaiMemory, d: StoredDelta, leaf: { id: strin
 export function deriveMemory(
   chat: STMessage[] | null,
   upToExclusive?: number,
-): Pick<BaibaiMemory, 'state' | 'protagonist' | 'items' | 'plans' | 'scenes' | 'npcs' | 'itemLog' | 'lifeDetails' | 'vars'> {
+): Pick<BaibaiMemory, 'state' | 'protagonist' | 'items' | 'plans' | 'scenes' | 'npcs' | 'itemLog' | 'lifeDetails' | 'knowledge' | 'vars'> {
   const mem = createEmptyMemory();
   // 变量从三层合并模板起算(无 chat 也返回初始状态);seed 时展开模板里的 ST 宏({{user}} 等)
   mem.vars = expandVarMacros(mergeTemplates(memory.varTemplates));
-  if (!chat) return { state: mem.state, protagonist: mem.protagonist, items: mem.items, plans: mem.plans, scenes: mem.scenes, npcs: mem.npcs, itemLog: mem.itemLog, lifeDetails: mem.lifeDetails, vars: mem.vars };
+  if (!chat) return { state: mem.state, protagonist: mem.protagonist, items: mem.items, plans: mem.plans, scenes: mem.scenes, npcs: mem.npcs, itemLog: mem.itemLog, lifeDetails: mem.lifeDetails, knowledge: mem.knowledge, vars: mem.vars };
   const end = typeof upToExclusive === 'number' ? Math.min(upToExclusive, chat.length) : chat.length;
   for (let i = 0; i < end; i++) {
     if (chat[i]?.extra?.bbs_omit) continue; // 番外楼:不参与派生重放
@@ -1565,7 +1572,7 @@ export function deriveMemory(
   }
   // 只留最近若干条变动(注入/喂模型够用即可,省 token)
   if (mem.itemLog.length > ITEM_LOG_KEEP) mem.itemLog = mem.itemLog.slice(-ITEM_LOG_KEEP);
-  return { state: mem.state, protagonist: mem.protagonist, items: mem.items, plans: mem.plans, scenes: mem.scenes, npcs: mem.npcs, itemLog: mem.itemLog, lifeDetails: mem.lifeDetails, vars: mem.vars };
+  return { state: mem.state, protagonist: mem.protagonist, items: mem.items, plans: mem.plans, scenes: mem.scenes, npcs: mem.npcs, itemLog: mem.itemLog, lifeDetails: mem.lifeDetails, knowledge: mem.knowledge, vars: mem.vars };
 }
 
 /** 变动日志保留的最近条数(注入与喂摘要共用)。 */
@@ -1691,8 +1698,15 @@ function parseShortRef(ref: string): number | null {
 /**
  * 把 AI 返回的 SummaryDelta 固化成可持久化的 StoredDelta。
  * 关键:plans.resolve 的运行期短序号(p1/p2…)按 openPlansOrdered 翻译成**稳定 plan id**。
+ * knowledge:了解清单的上下文(提示词里展示的 k1/k2… 顺序 + 名册角色名);不给=功能关闭,AI 输出的了解一律丢弃。
  */
-export function finalizeDelta(delta: SummaryDelta, openPlansOrdered: { id: string }[], lifeDetailsOrdered: { id: string }[] = [], guard?: LocationEvidenceGuard): StoredDelta {
+export function finalizeDelta(
+  delta: SummaryDelta,
+  openPlansOrdered: { id: string }[],
+  lifeDetailsOrdered: { id: string }[] = [],
+  guard?: LocationEvidenceGuard,
+  knowledge?: { shown: { id: string }[]; npcNames: string[] },
+): StoredDelta {
   const out: StoredDelta = {};
   const time = optText(delta.time);
   const location = optText(delta.location);
@@ -1820,6 +1834,13 @@ export function finalizeDelta(delta: SummaryDelta, openPlansOrdered: { id: strin
     const remove = arr(delta.lifeDetails.remove).map(resolveDetailRef).filter((x): x is string => !!x);
     if (remove.length) lifeDetails.remove = remove;
     if (Object.keys(lifeDetails).length) out.lifeDetails = lifeDetails;
+  }
+
+  if (knowledge) {
+    // 本楼新登场的角色也算名册:初见当场得知的事要能记上
+    const names = [...knowledge.npcNames, ...(out.npcs?.add ?? []).map(n => n.name)];
+    const ops = finalizeKnowledge(delta.knowledge, knowledge.shown, names);
+    if (ops.length) out.knowledge = ops;
   }
 
   if (Array.isArray(delta.vars) && delta.vars.length) {
@@ -1978,6 +1999,11 @@ export function appendOpToLatestLeaf(op: StoredDelta): boolean {
     ? deriveMemory(chat, index).lifeDetails
     : undefined;
   if (mergeLifeDetailsOp(d, op.lifeDetails, { leafId: leaf.id, existingDetails: existingLifeDetails })) changed = true;
+  if (op.knowledge?.length) {
+    // 有序日志直接追加:重放严格按先后施加,不需要跨桶抵消
+    (d.knowledge ??= []).push(...op.knowledge);
+    changed = true;
+  }
   if (op.varOps?.length) {
     // 追加本次命令到最新叶子(按顺序,后施加者覆盖前者)
     (d.varOps ??= []).push(...op.varOps);
@@ -2025,6 +2051,24 @@ export function updateLifeDetail(id: string, patch: Omit<LifeDetailUpdate, 'id'>
 /** 手动删除一条生活细节。无有效叶子时返回 false。 */
 export function removeLifeDetail(id: string): boolean {
   return appendOpToLatestLeaf({ lifeDetails: { remove: [id] } });
+}
+
+/** 手动给某角色添一条了解(老熟人的底子靠这里补;可写反向条目,如「不知道主角是王子」)。无有效叶子时返回 false。 */
+export function addKnowledge(subject: string, text: string): boolean {
+  const s = subject.trim();
+  const t = text.trim();
+  return s && t ? appendOpToLatestLeaf({ knowledge: [{ op: 'add', subject: s, text: t }] }) : false;
+}
+
+/** 手动改写一条了解(揭穿/纠正认知)。无有效叶子时返回 false。 */
+export function updateKnowledge(id: string, text: string): boolean {
+  const t = text.trim();
+  return t ? appendOpToLatestLeaf({ knowledge: [{ op: 'update', id, text: t }] }) : false;
+}
+
+/** 手动删除一条了解。无有效叶子时返回 false。 */
+export function removeKnowledge(id: string): boolean {
+  return appendOpToLatestLeaf({ knowledge: [{ op: 'remove', id }] });
 }
 
 /**
@@ -2175,6 +2219,8 @@ export function editNpc(
       lifeDetails: { update: memory.lifeDetails
         .filter(d => lifeDetailSubject(d) !== 'user' && norm(lifeDetailSubject(d)) === norm(oldName))
         .map(d => ({ id: d.id, subject: newName })) },
+      // 了解清单同理:按名字挂在角色身上,改名不跟过去就成了孤儿
+      knowledge: knowledgeOf(memory.knowledge, oldName).map(k => ({ op: 'update' as const, id: k.id, subject: newName })),
     });
   }
   return appendOpToLatestLeaf({ npcs: { update: [{ name: newName, ...fields }] } });

@@ -448,6 +448,30 @@ export interface LifeDetailUpdate {
 }
 
 /**
+ * 了解清单一条:某角色目前知道/以为的一件主角的事(防人设全知:没记的私事默认不知道)。
+ * 记的是角色的认知而非真相,把握程度写进句子(认定…/怀疑…/听说…/主角自称…),被骗就照记被骗后的认知。
+ */
+export interface MemKnowledge {
+  /** 稳定 id:know:${leafId}#${操作序号}(重放幂等、手动 op 可稳定引用) */
+  id: string;
+  /** 知情的角色名(NPC 名册中的名字;只记角色→主角) */
+  subject: string;
+  text: string;
+  /** 记录时的故事内时间 */
+  createdTime?: string;
+  createdAt: number;
+}
+
+/**
+ * 了解清单的存储操作:有序日志,按数组顺序重放。
+ * 不学生活小档案的 add→update→remove 分桶——手动「删了再加回」按分桶顺序会被吞掉。
+ */
+export type KnowledgeOp =
+  | { op: 'add'; subject: string; text: string }
+  | { op: 'update'; id: string; subject?: string; text?: string }
+  | { op: 'remove'; id: string };
+
+/**
  * 顶层记忆对象。
  * **只有 version + summaries 是真源并持久化**;state / items / plans 是从 summaries
  * 重放算出的派生缓存(供页面响应式读取,saveMemory 不写它们)。
@@ -470,6 +494,8 @@ export interface BaibaiMemory {
   itemLog: ItemLogEntry[];
   /** 派生缓存:主角及角色生活小档案(从叶子 delta 重放) */
   lifeDetails: MemLifeDetail[];
+  /** 派生缓存:各角色对主角的了解清单(从叶子 delta 重放) */
+  knowledge: MemKnowledge[];
   /** 真源镜像:三层变量定义模板(global/char 来自 settings,chat 来自 chatMetadata) */
   varTemplates: Record<VarTier, VarTemplate>;
   /** 派生缓存:变量当前状态(从合并模板起、fold 各叶子 varOps 得到的 JSON 树) */
@@ -486,6 +512,7 @@ export function createEmptyMemory(): BaibaiMemory {
     items: [],
     plans: [],
     lifeDetails: [],
+    knowledge: [],
     scenes: [],
     npcs: [],
     itemLog: [],
@@ -683,6 +710,14 @@ export interface SummaryDelta {
     /** 删除(短序号 d1/d2 或稳定 id) */
     remove?: string[];
   };
+  /** 指令型:了解清单增删改(可选;只记角色亲耳听到/亲眼看到/听人说的主角的事) */
+  knowledge?: {
+    add?: { who: string; text: string }[];
+    /** 短序号 k1/k2 或稳定 id */
+    update?: { id: string; text: string }[];
+    /** 短序号 k1/k2 或稳定 id */
+    remove?: string[];
+  };
   /**
    * 指令型:自定义变量的路径命令数组(仿 MVU)。AI 看当前 JSON 状态 + 说明,产出本楼新事件对应的命令:
    *  - { "op":"set", "path":"好感度", "value":60 }
@@ -751,5 +786,7 @@ export interface StoredDelta {
     /** 删除(稳定 id) */
     remove?: string[];
   };
+  /** 了解清单:按顺序施加的操作日志(AI 与手动共用) */
+  knowledge?: KnowledgeOp[];
   varOps?: VarOp[];
 }

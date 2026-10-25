@@ -1040,6 +1040,13 @@ function exportPublicApiDocument() {
         </label>
         <p class="bbs-field-hint">NPC 名册里的五档好感估计(内心好感/外在态度/说明)。记录与角色页展示始终开启;关闭后名册照发、只是不附带好感——适合角色卡自带好感系统、不想两套并行的场合。</p>
 
+        <!-- 不随「仅注入摘要」禁用:此开关同时管记录 -->
+        <label class="bbs-switch-row">
+          <span class="bbs-field-label">角色对主角的了解</span>
+          <input v-model="apiSettings.injection.knowledge" type="checkbox" class="bbs-checkbox" />
+        </label>
+        <p class="bbs-field-hint">记录每个角色知道(或以为)的主角的事,发给主要角色和在场角色;没记过、剧情里也没交代过的私事(身世、经历、秘密、喜好、名字)默认该角色不知道,防止角色凭人设/世界书全知主角。有记录的角色卡上会显示最近两条,点开或点灯泡按钮可查看和修改。关闭后不再记录也不再发送,已有清单保留。此项独立于「NPC 名册」:只关名册时,这里仍会带出主要/在场角色的名字。</p>
+
         <label class="bbs-switch-row">
           <span class="bbs-field-label">物品信息</span>
           <input v-model="apiSettings.injection.items" type="checkbox" class="bbs-checkbox" :disabled="apiSettings.summaryOnlyMode || !apiSettings.injection.scenes" />

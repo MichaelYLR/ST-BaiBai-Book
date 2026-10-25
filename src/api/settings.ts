@@ -176,6 +176,9 @@ export interface InjectionSections {
   items: boolean;
   /** 场景信息(当前地点+祖先链+其他已知地点);关闭后 NPC/物品随之不注入 */
   scenes: boolean;
+  /** 角色对主角的了解清单。与其他项不同,它同时管「记录」:关掉就连副 API 的规则一起省掉(零 token),已有清单保留。
+   *  不依赖场景注入——在场判定读的是记忆数据,不是注入文本。 */
+  knowledge: boolean;
 }
 
 export interface ApiSettings {
@@ -342,7 +345,7 @@ function defaults(): ApiSettings {
     assignments: { summary: '', resummary: '' },
     autoSummaryEnabled: true,
     summaryOnlyMode: false,
-    injection: { sceneFocus: true, lifeDetails: true, protagonist: true, npcs: true, npcAffinity: true, items: true, scenes: true },
+    injection: { sceneFocus: true, lifeDetails: true, protagonist: true, npcs: true, npcAffinity: true, items: true, scenes: true, knowledge: true },
     keepRecent: 3,
     excludedChars: [],
     excludedWorldNames: [],
@@ -421,6 +424,7 @@ function normalize(raw: unknown): ApiSettings {
     npcAffinity: typeof ri.npcAffinity === 'boolean' ? ri.npcAffinity : true,
     items: typeof ri.items === 'boolean' ? ri.items : true,
     scenes: typeof ri.scenes === 'boolean' ? ri.scenes : true,
+    knowledge: typeof ri.knowledge === 'boolean' ? ri.knowledge : true,
   };
   // vector 同为嵌套对象(且内含子对象),逐层兜底,老数据缺字段时回退默认。
   // 注:旧结构曾有 vector.channels + {channel,model};扁平化后弃用,逐角色按 url/key/model 兜底,

@@ -16,6 +16,7 @@
 
 import { apiSettings, type Verbosity } from '@/api/settings';
 import { fmtLifeDetail } from './lifeDetails';
+import { fmtKnowledgeForSummary } from './knowledge';
 import { fmtNpcSummaryList, NPC_AFFINITY_FIELDS, type NpcSummaryView } from './npcRelations';
 import { RULE_COMPLETE_TIME_ANCHOR } from './timeTag';
 // 新提示词正文以原版文本文件为准(?raw 内联,可原样保留排版与标签)。
@@ -25,7 +26,7 @@ import resummary2Raw from './prompts/resummary2.txt?raw';
 import tasksRaw from './prompts/tasks.txt?raw';
 import builtinProtocolsRaw from './prompts/builtin-protocols.txt?raw';
 import dataWrappersRaw from './prompts/data-wrappers.txt?raw';
-import type { ItemLogEntry, JsonValue, MemLifeDetail, MemPlan, MemProtagonist, PlanOutcome, SceneFocus } from './types';
+import type { ItemLogEntry, JsonValue, MemKnowledge, MemLifeDetail, MemPlan, MemProtagonist, PlanOutcome, SceneFocus } from './types';
 
 /** 按「===== NAME =====」分节解析协议文件(08)。 */
 function protocolSections(raw: string): Record<string, string> {
@@ -268,6 +269,16 @@ export const RULE_LIFE_DETAILS = `═══ 【生活小档案规则】(lifeDeta
   ✦ 记错了 → remove。拿不准不动,不能用另一个人的偏好覆盖本人的条目。
 【分工】饮食、作息等生活细节归这里;身份/外貌/当前着装/健康状态仍归 protagonist 或 npcs,不要重复记录。这里只放值得跨场景保留的细节,不是每轮流水账。
 【克制】这些细节仅作相关人物的写作参考,不是写作任务;严禁在 summary 里逐条罗列,不得把某人的习惯套给别人。`;
+
+/** 了解清单规则(knowledge 字段)。不用 {{user}}:规则作为宏值插入,不会再展开一遍。 */
+export const RULE_KNOWLEDGE = `═══ 【了解清单规则】(knowledge 字段) ═══
+记录**每个 NPC 目前知道/以为的关于主角的事**。写作 AI 会把它当作角色的「知情范围」:清单里没有的主角私事,该角色默认不知道,以此防止角色凭人设或世界书全知主角。只记角色对主角,不记角色之间;好感与态度仍归 npcs。
+【来源铁律】只记该角色本轮**亲耳听到、亲眼看到、或听别人告诉**的:主角当面说的、当着其面做的、第三人转告的。主角的内心独白、旁白叙述、该角色不在场时发生的事一律不算——该角色并不知道。
+【记角色以为的,不是真相】把握程度写进句子开头:认定…/怀疑…/听说…/主角自称…。角色被骗就照记被骗后的认知(主角谎称是商人 → "认定主角是行商"),不注明真相;日后被揭穿,用 update 改写原条(如"得知主角其实是王子,此前一直被瞒"),不要另加一条矛盾的。
+【记什么】主角的名字(角色第一次得知时记)、身世、过往经历、秘密、私人喜好与习惯、主角自称或刻意隐瞒的身份。外貌、当场可见的举动、公开身份人人看得到,不必记;一次性琐事不记。
+【查重】先对照材料里的「角色对主角的了解」列表,按"同一角色 + 同义内容"查重;已有的不重复 add,认知加深或改变用 update 改原条。
+【add】who 写 NPC 名册中(含本楼 npcs.add 新登场)的确切名字,不能是主角;名册里没有的角色不记。text 一句话只写一件事。
+【update/remove】用该列表的编号 k1、k2… 指代:认知被纠正/加深 → update 改 text;记错了(该角色其实不知道/记到了别人头上)→ remove。拿不准不动。`;
 
 /** 计划/悬念规则(plans 字段)。 */
 export const RULE_PLANS = `═══ 【计划/悬念规则】(plans 字段) ═══
@@ -551,6 +562,8 @@ interface BuildArgs {
   sceneFocus: SceneFocus | null;
   /** 主角及主要角色的生活小档案(当前已记录;供人物核对、查重与 d 序号指代) */
   lifeDetails: MemLifeDetail[];
+  /** 相关角色(在场/主要/本轮点名)的了解清单,顺序即 k1/k2…;省略=功能关闭,规则/字段/材料整块不发 */
+  knowledge?: MemKnowledge[];
   /** 现有物品名列表 */
   items: { name: string; qty?: number; desc?: string; carried?: boolean; location?: string }[];
   /** 近期物品变动日志(已结算的账,防重复结算用) */
@@ -918,6 +931,12 @@ export function buildSummaryPrompt(a: BuildArgs): { system: string; user: string
     lifedetails_block: `- 生活小档案(已记录,用编号 d1/d2… 指代;只读参考,勿重复记录 —— 见下方【生活小档案规则】):\n${fmtLifeDetails(a.lifeDetails, a.user || '主角')}\n`,
     lifedetails_field: LIFE_DETAILS_FIELD_TMPL,
     lifedetails_rule: `\n${RULE_LIFE_DETAILS}\n`,
+    // 了解清单三处:功能关闭(未传 knowledge)时全为空串,提示词与关闭前一字不差
+    knowledge_block: a.knowledge
+      ? `- 角色对主角的了解(相关角色已记下的认知,用编号 k1/k2… 指代;只读参考,勿重复记录 —— 见【了解清单规则】):\n${fmtKnowledgeForSummary(a.knowledge)}\n`
+      : '',
+    knowledge_field: a.knowledge ? KNOWLEDGE_FIELD_TMPL : '',
+    knowledge_rule: a.knowledge ? `\n${RULE_KNOWLEDGE}\n` : '',
     content: a.content,
     time_field: a.hasTimeTags ? TIME_FIELD_WITH_TAGS : TIME_FIELD_NO_TAGS,
     time_rule: a.hasTimeTags ? TIME_RULE_WITH_TAGS : TIME_RULE_NO_TAGS,
@@ -941,6 +960,7 @@ export function buildSummaryPrompt(a: BuildArgs): { system: string; user: string
   const prompt = fill(custom, macros);
   const supplements = [PROTAGONIST_PROTOCOL_SUPPLEMENT, RULE_ABSOLUTE_TIME_LANGUAGE, SCENE_FOCUS_PROTOCOL_SUPPLEMENT];
   supplements.push(LIFE_DETAILS_PROTOCOL_SUPPLEMENT);
+  if (a.knowledge) supplements.push(KNOWLEDGE_PROTOCOL_SUPPLEMENT);
   if (!prompt.includes('【内心好感与外在态度规则】')) supplements.push(RULE_NPC_AFFINITY);
   // 关系线保留:自定义模板未带入时补上,保证慢热互动不在摘要/压缩里被删空(与内置模板同源)
   if (!prompt.includes('【关系线保留】')) supplements.push(RULE_RELATION_MOMENTUM);
@@ -953,7 +973,8 @@ export function buildSummaryPrompt(a: BuildArgs): { system: string; user: string
     system: fill(supplements.join('\n\n'), macros),
     user: `${prompt}\n\n【主角当前档案(本轮之前,只读参考)】\n${macros.protagonist_block}`
       + (prompt.includes(macros.npcs_block) ? '' : `\n\n【已登场NPC(本轮之前,好感估计只作基线,不重复结算)】\n${macros.npcs_block}`)
-      + (prompt.includes(macros.lifedetails_block.trim()) ? '' : `\n\n${macros.lifedetails_block}`),
+      + (prompt.includes(macros.lifedetails_block.trim()) ? '' : `\n\n${macros.lifedetails_block}`)
+      + (!a.knowledge || prompt.includes(macros.knowledge_block.trim()) ? '' : `\n\n${macros.knowledge_block}`),
   };
 }
 
@@ -974,6 +995,23 @@ const LIFE_DETAILS_FIELD_TMPL = `,
     "archive": ["d2"],
     "remove": ["d3"]
   }`;
+
+/** 了解清单字段的 JSON 模板片段(带前导逗号,接在 lifeDetails 之后)。 */
+const KNOWLEDGE_FIELD_TMPL = `,
+  "knowledge": {
+    "add": [{ "who": "NPC名册中的确切名字(不能是主角)", "text": "该角色本轮亲耳听到/亲眼看到/被告知的主角的一件事,一句话,开头写把握:认定/怀疑/听说/主角自称" }],
+    "update": [{ "id": "k1", "text": "认知被纠正或加深后的新内容" }],
+    "remove": ["k2"]
+  }`;
+
+/** 自定义摘要模板不认识了解清单;功能开启时补字段协议(可选字段,不破坏旧模板)。 */
+const KNOWLEDGE_PROTOCOL_SUPPLEMENT = `【柏宝书了解清单兼容协议】
+最终 JSON 根对象可增加一个可选字段(没有可记的就不要输出它):
+{
+${KNOWLEDGE_FIELD_TMPL.replace(/^,\n/, '')}
+}
+
+${RULE_KNOWLEDGE}`;
 
 /**
  * 批量摘要的参数。批量只产 summary + 起止时间,故不传物品/计划(避免多楼顺序错乱)——
