@@ -21,8 +21,8 @@ import { NPC_AFFINITY_FIELDS, affinityLevelFromInput, fmtNpcAffinity } from '@/m
 import ConfirmDialog from '@/components/ConfirmDialog.vue';
 import { getContext, type STMessage } from '@/st/context';
 import { toast } from '@/st/toast';
-import { getLeaf, leafValid, deleteLeafAt, editLeafFull, planContentById, describeVarOp } from '@/memory/apply';
-import { engineState, floorBackfillState, regenerateFloor, setFloorOmit, summarizeFloor } from '@/memory/engine';
+import { createManualLeaf, getLeaf, leafValid, deleteLeafAt, editLeafFull, planContentById, describeVarOp } from '@/memory/apply';
+import { engineState, floorBackfillState, regenerateFloor, setFloorOmit, summarizeFloor, syncHiddenNow } from '@/memory/engine';
 import { derivedMeta } from '@/memory/store';
 import { ui } from '@/state/ui';
 import type { LeafExtra, StoredDelta, ItemDelta, NpcDelta, ProtagonistDelta, ConditionPatch, VarOp, JsonValue } from '@/memory/types';
@@ -401,6 +401,33 @@ function saveText() {
   editKey.value = null;
 }
 
+/* —— 手写摘要(此楼还没有摘要时)——
+ * 不走 beginEdit:那里有「必须已有叶子」的守卫。这里是从零造叶子,故自带展开 + 聚焦。
+ * 时间留空也可保存:保存后叶子存在,时间 chip 会出现,可再补。 */
+function beginManual() {
+  if (omit.value || valid.value || busy.value || engineState.running) return;
+  edit.text = '';
+  expanded.value = true;
+  focusEl.value = null;
+  editKey.value = 'manual';
+  void nextTick(() => {
+    autosizeAll();
+    if (!isTouch) focusEl.value?.focus();
+  });
+}
+function saveManual() {
+  if (!edit.text.trim()) return;
+  const ok = createManualLeaf(props.floor, { text: edit.text });
+  if (!ok) {
+    toast('手写失败:该楼状态已变化,请重试', 'warning');
+    return;
+  }
+  editKey.value = null;
+  // 与主界面同口径:该楼若已退出保留窗口,写摘要后原文应立即隐藏
+  void syncHiddenNow();
+  toast(`已手写楼层 #${props.floor} 的摘要`, 'success');
+}
+
 /* —— 时间 —— */
 function editTime() {
   edit.timeStart = leaf.value?.timeStart ?? '';
@@ -710,6 +737,17 @@ const groups = computed(() => [
           <Icon name="sparkles" />
         </button>
         <button
+          v-if="!omit && !valid"
+          class="bbs-fp-summarybtn"
+          type="button"
+          title="手写这一楼的摘要(不调用 AI)"
+          aria-label="手写摘要"
+          :disabled="busy || engineState.running"
+          @click.stop="beginManual"
+        >
+          <Icon name="edit" />
+        </button>
+        <button
           class="bbs-fp-summarybtn"
           type="button"
           :title="summaryActionTitle"
@@ -890,7 +928,24 @@ const groups = computed(() => [
               </div>
             </template>
 
-            <p v-else class="bbs-summary-text bbs-fp-text is-muted">此楼尚无摘要。</p>
+            <template v-else>
+              <!-- 手写摘要:此楼还没有叶子,从零写一条(不调 AI)。时间可保存后点上方时间 chip 补。 -->
+              <div v-if="editKey === 'manual'" class="bbs-fp-texteditor">
+                <textarea
+                  :ref="setFocus"
+                  v-model="edit.text"
+                  class="bbs-input bbs-fp-textarea"
+                  rows="3"
+                  placeholder="写下这一楼的摘要…(故事内时间可在保存后补)"
+                  @input="onTextInput"
+                ></textarea>
+                <div class="bbs-fp-editrow-actions">
+                  <button class="bbs-btn" type="button" @click="cancelEdit">取消</button>
+                  <button class="bbs-btn bbs-btn-primary" type="button" :disabled="!edit.text.trim()" @click="saveManual">保存</button>
+                </div>
+              </div>
+              <p v-else class="bbs-summary-text bbs-fp-text is-muted">此楼尚无摘要。</p>
+            </template>
 
             <!-- 页脚:删除整楼摘要(行内两步确认,防误触) -->
             <div v-if="leaf && !omit" class="bbs-fp-footer">

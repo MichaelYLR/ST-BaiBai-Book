@@ -414,6 +414,13 @@
   /* 与 loc 同样 1px 边框,保证两者等高 */
 }
 
+/* 手写摘要徽标:描边款,与自动摘要的实底徽标拉开层次——它标注的是「来源」而不是层级 */
+.bbs-summary-badge.is-manual {
+  color: var(--bbs-ink-soft);
+  background: transparent;
+  border: 1px dashed var(--bbs-line);
+}
+
 /* 楼层号/收纳数:描边定位标签;tabular 数字对齐 */
 .bbs-summary-loc {
   color: var(--bbs-ink-soft);

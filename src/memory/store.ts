@@ -5,7 +5,7 @@ import { deriveMemory, getLeaf, leafValid } from './apply';
 import { isAiFloor, pendingAiFloors } from './engine';
 import { latestStoryTime } from './timeTag';
 import type { BaibaiMemory, LeafExtra, MemSummary, StoredDelta, VarTemplate, VarTier } from './types';
-import { createEmptyMemory, MEMORY_KEY, MEMORY_VERSION, normalizeTemplate } from './types';
+import { createEmptyMemory, isAtomicSummary, MEMORY_KEY, MEMORY_VERSION, normalizeTemplate } from './types';
 
 /**
  * 响应式记忆镜像。
@@ -29,6 +29,7 @@ export interface LeafView {
   msgIndex: number;
   active: boolean; // 所在消息已隐藏(is_system)
   stale: boolean; // 正文已变、尚未重摘
+  manual: boolean; // 用户手写(非 AI 生成),供列表标注
 }
 export const derivedMeta = reactive<{ hasLeaf: boolean; leaves: LeafView[]; pendingFloors: number[]; latestStoryTime: string; rev: number }>({
   hasLeaf: false,
@@ -96,6 +97,7 @@ export function recomputeDerived(): void {
         msgIndex: i,
         active: m.is_system === true,
         stale: !valid,
+        manual: leaf.manual === true,
       });
     }
   }
@@ -284,12 +286,15 @@ function cleanSummaryNode(s: MemSummary, idx: number): MemSummary {
     timeLabel: optText(s.timeLabel),
     childIds: Array.isArray(s.childIds) ? s.childIds.map(x => scalarText(x)).filter(Boolean) : [],
     imported: s.imported === true ? true : undefined,
+    manual: s.manual === true ? true : undefined,
+    // 楼层范围对导入历史与手写区间都有效,统一按「原子节点」放行,否则手写区间的范围会在
+    // 每次 loadMemory 被清成 undefined(节点还在、覆盖范围却没了,楼层又回到待摘要)。
     importedFloorStart:
-      s.imported === true && Number.isFinite(s.importedFloorStart) && (s.importedFloorStart as number) >= 0
+      isAtomicSummary(s) && Number.isFinite(s.importedFloorStart) && (s.importedFloorStart as number) >= 0
         ? Math.floor(s.importedFloorStart as number)
         : undefined,
     importedFloorEnd:
-      s.imported === true && Number.isFinite(s.importedFloorEnd) && (s.importedFloorEnd as number) >= 0
+      isAtomicSummary(s) && Number.isFinite(s.importedFloorEnd) && (s.importedFloorEnd as number) >= 0
         ? Math.floor(s.importedFloorEnd as number)
         : undefined,
   };

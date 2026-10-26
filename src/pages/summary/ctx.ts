@@ -21,6 +21,8 @@ export interface SummaryRow {
   msgIndex?: number;
   stale?: boolean;
   imported?: boolean;
+  /** 用户手写(非 AI 生成),卡片上打「手写」徽标 */
+  manual?: boolean;
 }
 
 export interface SummaryCtx {
@@ -35,7 +37,7 @@ export interface SummaryCtx {
   onDelete: (r: SummaryRow) => void;
   nodeFloors: (n: ViewNode, map: Map<string, ViewNode>) => [number, number];
   toRow: (n: ViewNode, map: Map<string, ViewNode>) => SummaryRow;
-  levelLabel: (level: number, imported?: boolean) => string;
+  levelLabel: (level: number, imported?: boolean, manual?: boolean) => string;
   floorLabel: (r: SummaryRow) => string;
   rowTime: (r: SummaryRow) => string;
   rowRelative: (r: SummaryRow) => string;

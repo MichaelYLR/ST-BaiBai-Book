@@ -10,7 +10,7 @@ import { readItemsTagText, writeItemLogTag, writeVarLogTag } from './timeTag';
 import { scheduleVectorIndex } from './vector';
 import { invalidateRecallCache } from './vector/cache';
 import { applyConditionPatch, hasConditionPatchContent, stripConditionFragmentIds } from './conditionPatch';
-import { createEmptyMemory } from './types';
+import { createEmptyMemory, isAtomicSummary } from './types';
 import type { BaibaiMemory, ConditionPatch, ConditionPatchOp, ItemDelta, ItemLogEntry, JsonValue, LeafExtra, LifeDetailAdd, LifeDetailUpdate, MemLifeDetail, MemNpc, MemPlan, MemScene, MemSummary, NpcAffinity, NpcDelta, NpcPresence, PlanResolveItem, PlanUpdateItem, ProtagonistDelta, SceneDelta, SceneFocus, SceneOp, SceneReparent, StoredDelta, SummaryDelta, VarOp, VarTemplate, VarTier } from './types';
 
 // 供既有调用方继续从 apply 取在场类型;定义在 types.ts 与名册展示共用。
@@ -1867,12 +1867,115 @@ export function addSummary(
     timeLabel: s.timeLabel,
     childIds: s.childIds ?? [],
     imported: s.imported,
+    manual: s.manual,
     importedFloorStart: s.importedFloorStart,
     importedFloorEnd: s.importedFloorEnd,
   };
   memory.summaries.push(rec);
   saveMemory();
   return rec;
+}
+
+/* ============ 手写摘要(用户写正文,不走 AI) ============ */
+
+/**
+ * 在指定 AI 楼手写一条摘要(不调 AI)。
+ *
+ * 落成**真实叶子**而非原子节点:叶子的语义就是「一楼一摘要」,隐藏、状态重放、编辑、
+ * 向量召回全都按这个前提写。单楼硬塞原子节点会绕开 coveredSet 的段推进逻辑。
+ *
+ * 守卫全部失败返回 false;页面在提交前已逐条校验并给出具体原因,这里是最后一道防线。
+ * delta 为空是刻意的:一段手写散文不该凭空改动物品/角色/计划,只有用户填了故事内时间
+ * 才推进 delta.time(与 editLeafAt 同口径)。
+ */
+export function createManualLeaf(
+  index: number,
+  patch: { text: string; timeStart?: string; timeEnd?: string },
+): boolean {
+  const chat = getContext()?.chat;
+  const m = chat?.[index];
+  if (!chat || !m) return false;
+  if (!patch.text.trim()) return false;
+  if (m.is_user) return false;
+  if (m.extra?.bbs_omit) return false;
+  if (leafValid(m)) return false; // 已有摘要 → 应走编辑,不静默覆盖
+
+  const s = patch.timeStart?.trim() ?? '';
+  const e = patch.timeEnd?.trim() ?? '';
+  const leaf: LeafExtra = {
+    id: makeLeafId(),
+    text: patch.text.trim(),
+    delta: {},
+    timeStart: s || undefined,
+    timeEnd: e || undefined,
+    createdAt: Date.now(),
+    // 与 engine.applyLeafForFloor 同口径:记录生成时所在页码,翻页后自然失效
+    swipe: typeof m.swipe_id === 'number' ? m.swipe_id : 0,
+    manual: true,
+    v: 1,
+  };
+  // 覆盖型当前时间取结束时间;两端皆空才不带(叶子无时间就不推进状态时间)
+  if (e) leaf.delta.time = e;
+  else if (s) leaf.delta.time = s;
+
+  m.extra = { ...(m.extra ?? {}), bbs_leaf: leaf };
+  recomputeDerived();
+  scheduleLeafFlush();
+  invalidateRecallCache(); // 新叶子 → 召回结果会变
+  scheduleVectorIndex(); // 手写摘要同样入库,长对话里才召得回
+  return true;
+}
+
+/**
+ * 手写一条覆盖 [#start, #end] 的原子摘要节点(不调 AI)。
+ *
+ * 区间必须走原子节点:叶子模型是「一楼一摘要」,给区间内每楼都造空叶子会让摘要页冒出
+ * 一串空卡片、向量库索引空正文、总结压缩凭空多出一批空根。原子节点天然满足
+ * 「不算待摘 / 算已覆盖 / 按范围注入」三件事(见 engine.ts 的 atomicRanges)。
+ *
+ * 调用方负责校验:区间内无有效叶子、不与其它原子节点重叠、终点是 AI 楼。
+ */
+export function createManualRangeSummary(
+  start: number,
+  end: number,
+  patch: { text: string; timeStart?: string; timeEnd?: string },
+): MemSummary | null {
+  // 起止顺序由调用方保证(页面会先归一),这里再兜一次:反着填不该被静默压成单楼
+  const lo = Math.max(0, Math.min(Math.floor(start), Math.floor(end)));
+  const hi = Math.max(0, Math.max(Math.floor(start), Math.floor(end)));
+  const text = patch.text.trim();
+  if (!text) return null;
+
+  // 时间戳排在已有节点之前,让它在时间序里代表「更早的一段」;与导入历史同款处理
+  const existingTimes = [
+    ...memory.summaries.map(s => s.createdAt),
+    ...derivedLeafTimes(),
+  ].filter(Number.isFinite);
+  const createdAt = (existingTimes.length ? Math.min(...existingTimes) : Date.now()) - 1;
+
+  return addSummary({
+    text,
+    level: 2,
+    auto: false,
+    childIds: [],
+    manual: true,
+    importedFloorStart: lo,
+    importedFloorEnd: hi,
+    timeStart: patch.timeStart?.trim() || undefined,
+    timeEnd: patch.timeEnd?.trim() || undefined,
+    createdAt,
+  });
+}
+
+/** 现存有效叶子的生成时刻(供手写区间节点定 createdAt 顺序) */
+function derivedLeafTimes(): number[] {
+  const chat = getContext()?.chat ?? [];
+  const out: number[] = [];
+  for (const m of chat) {
+    const lf = getLeaf(m);
+    if (lf && leafValid(m) && Number.isFinite(lf.createdAt)) out.push(lf.createdAt);
+  }
+  return out;
 }
 
 /* ============ 叶子(在消息 extra 上) ============ */
@@ -2480,7 +2583,7 @@ export interface DeleteSummarySubtreesResult {
   leaves: number;
   /** 实际删除的总结节点数(含因子节点消失而一并失效的祖先)。 */
   summaries: number;
-  /** 被删除的导入历史数;大于 0 时调用方需同步正文隐藏状态。 */
+  /** 被删除的原子节点数(导入历史 + 手写区间);大于 0 时调用方需同步正文隐藏状态。 */
   imported: number;
 }
 
@@ -2512,7 +2615,7 @@ export function deleteSummarySubtrees(rootIds: string[]): DeleteSummarySubtreesR
       return;
     }
     summaryIds.add(id);
-    if (summary.imported) {
+    if (isAtomicSummary(summary)) {
       imported++;
       return;
     }
@@ -2599,7 +2702,7 @@ export function pruneBrokenComps(): boolean {
     if (verdict.has(id)) return verdict.get(id)!;
     const comp = byId.get(id);
     if (!comp) return liveLeafIds.has(id); // 不是压缩节点:看是不是现存有效叶子
-    if (comp.imported) return true; // 导入历史是无 child 的原子节点,楼层范围直接代表其完整性
+    if (comp.imported || comp.manual) return true; // 原子节点无 child,楼层范围直接代表其完整性
     if (stack.has(id)) return false; // 防环
     stack.add(id);
     let ok = comp.childIds.length > 0;

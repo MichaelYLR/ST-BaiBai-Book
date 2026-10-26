@@ -23,6 +23,7 @@ import { compactTimeLabel, formatRange, latestStoryTime, splitTimeLabel, timeTag
 import { relativeTimeLabel, weekdayLabel, ageDisplay, calculateRelativeDays } from './timeRel';
 import { selectViewNodes, selectLifeDetailsForInjection, type ViewNode } from './select';
 import type { LeafExtra, MemItem, MemLifeDetail, MemNpc, MemProtagonist, MemScene, MemSummary, SceneFocus } from './types';
+import { isAtomicSummary } from './types';
 
 // 摘要页列表复用同一套选择逻辑,经此 re-export(纯算法在 select.ts,零依赖、可单测)
 export { selectViewNodes, type ViewNode };
@@ -123,6 +124,13 @@ function buildView(
     }
   }
   for (const s of summaries) {
+    const atomic = isAtomicSummary(s);
+    // 导入历史以覆盖截止楼作为“历史发生位置”,便于 beforeIndex 判定;普通 comp 仍由后代叶子决定。
+    const endFloor = s.importedFloorEnd ?? -1;
+    // 手写区间整段一起隐藏,故「终点已隐藏」即代表整段已接管;整段还在窗口内则仍发全文,不注入。
+    // 用终点而非起点判定:起点可能是番外楼/用户楼(番外不进 coveredSet、永不被隐藏),
+    // 而终点在创建时已校验为正常 AI 楼,必然被覆盖。
+    const endHidden = chat?.[endFloor]?.is_system === true;
     byId.set(s.id, {
       id: s.id,
       kind: 'comp',
@@ -133,12 +141,12 @@ function buildView(
       timeLabel: s.timeLabel,
       createdAt: s.createdAt,
       childIds: s.childIds ?? [],
-      // 导入历史以覆盖截止楼作为“历史发生位置”,便于 beforeIndex 判定;普通 comp 仍由后代叶子决定。
-      msgIndex: s.imported ? (s.importedFloorEnd ?? -1) : -1,
-      active: s.imported === true,
-      atomic: s.imported === true,
+      msgIndex: atomic ? endFloor : -1,
+      active: s.imported === true ? true : atomic && endHidden,
+      atomic,
       floorStart: s.importedFloorStart,
       floorEnd: s.importedFloorEnd,
+      manual: s.manual === true,
     });
   }
 

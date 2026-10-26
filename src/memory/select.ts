@@ -24,11 +24,13 @@ export interface ViewNode {
   childIds: string[]; // comp 才有
   msgIndex: number; // leaf 才有意义(排序键);comp 取 -1
   active: boolean; // leaf:所在消息已隐藏
-  /** 无逐楼 child 的导入历史节点;选择算法把它视为与 leaf 同类的完整终端。 */
+  /** 原子覆盖节点(导入历史 / 手写区间):无逐楼 child,选择算法把它视为与 leaf 同类的完整终端。 */
   atomic?: boolean;
-  /** 原子导入历史的显式楼层范围。 */
+  /** 原子节点的显式楼层范围。 */
   floorStart?: number;
   floorEnd?: number;
+  /** 用户手写(非 AI 生成),供列表标注;不参与任何选择/有效性判定。 */
+  manual?: boolean;
 }
 
 /**

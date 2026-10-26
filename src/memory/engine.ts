@@ -14,6 +14,7 @@ import { clampToTimeTags, cleanBody, parseTimeRange, syncTimeTagRegex, writeItem
 import { renderSourceHints, type SourceExcerpt } from './sourceHints';
 import { memory, recomputeDerived, scheduleLeafFlush } from './store';
 import type { LeafExtra, SummaryDelta } from './types';
+import { isAtomicSummary } from './types';
 import { scheduleVectorIndex } from './vector';
 import { invalidateRecallCache } from './vector/cache';
 import { clearRecallInjection } from './vector/recall';
@@ -436,23 +437,36 @@ export function resolveKeepStart(chat: STMessage[]): number {
   return aiIdx[aiIdx.length - keep];
 }
 
-/** 当前森林里的导入历史覆盖范围。节点即使已被更高层总结收纳,其接管范围仍然有效。 */
-function importedHistoryRanges(): Array<[number, number]> {
+/**
+ * 原子覆盖范围(导入历史 / 手写区间)。节点即使已被更高层总结收纳,其接管范围仍然有效。
+ * forceHide 区分隐藏策略:
+ *  - 导入历史 = 前史接管,整段强制隐藏(不受最近窗口保留数影响,否则导入正文会与窗口内原文重复);
+ *  - 手写区间 = 局部补写,起点退出保留窗口后才整段隐藏(见 syncWindowHiddenState)。
+ * 两者都是「整段一条摘要」,所以隐藏也以整段为单位——只藏一半会让另一半原文与摘要对不上。
+ */
+export interface AtomicRange {
+  start: number;
+  end: number;
+  forceHide: boolean;
+}
+
+function atomicRanges(): AtomicRange[] {
   return memory.summaries
-    .filter(s => s.imported && Number.isFinite(s.importedFloorEnd))
+    .filter(s => isAtomicSummary(s) && Number.isFinite(s.importedFloorEnd))
     .map(s => {
       const start = Math.max(0, Math.floor(s.importedFloorStart ?? 0));
       const end = Math.max(start, Math.floor(s.importedFloorEnd ?? start));
-      return [start, end] as [number, number];
+      return { start, end, forceHide: s.imported === true };
     });
 }
 
-function floorInImportedRanges(floor: number, ranges: Array<[number, number]>): boolean {
-  return ranges.some(([start, end]) => floor >= start && floor <= end);
+function floorInAtomicRanges(floor: number, ranges: AtomicRange[]): boolean {
+  return ranges.some(({ start, end }) => floor >= start && floor <= end);
 }
 
-function importedHistoryCovers(floor: number): boolean {
-  return floorInImportedRanges(floor, importedHistoryRanges());
+/** 该楼是否已被某个原子节点接管(导入历史或手写区间)→ 不再自动/手动补摘。 */
+function atomicCovers(floor: number): boolean {
+  return floorInAtomicRanges(floor, atomicRanges());
 }
 
 /**
@@ -461,9 +475,9 @@ function importedHistoryCovers(floor: number): boolean {
  */
 export function pendingAiFloors(chat: STMessage[]): number[] {
   const out: number[] = [];
-  const imported = importedHistoryRanges();
+  const ranges = atomicRanges();
   for (let i = 0; i < chat.length; i++) {
-    if (floorInImportedRanges(i, imported)) continue;
+    if (floorInAtomicRanges(i, ranges)) continue;
     if (isAiFloor(chat[i]) && !leafValid(chat[i])) out.push(i);
   }
   return out;
@@ -519,7 +533,7 @@ export function openingPendingFloor(chat: STMessage[]): number {
   for (let i = lastAi - 1; i >= 0; i--) {
     if (chat[i]?.is_user || isAiFloor(chat[i])) return -1; // 前面已有玩家发言或其他 AI 楼 → 不是开场白
   }
-  if (importedHistoryCovers(lastAi)) return -1; // 已由导入历史接管,不再为开场白单独造叶子
+  if (atomicCovers(lastAi)) return -1; // 已被导入历史/手写区间接管,不再为开场白单独造叶子
   if (leafValid(chat[lastAi])) return -1; // 已摘 → 锚点已在
   const tag = parseTimeRange(clampToTimeTags(chat[lastAi].mes));
   if (tag.start && tag.end) return -1; // 开场白自带时间标签 → 主模型能读,不必先摘
@@ -690,7 +704,7 @@ export async function summarizeFloor(floor: number): Promise<void> {
   const ctx = getContext();
   if (!ctx) return;
   const chat = ctx.chat ?? [];
-  if (importedHistoryCovers(floor)) return;
+  if (atomicCovers(floor)) return;
   if (!isAiFloor(chat[floor]) || leafValid(chat[floor])) return;
   await runSummary(floor);
   await afterSummaryHideAndInject(chat);
@@ -867,7 +881,16 @@ export function coalesceRanges(indices: number[]): Array<[number, number]> {
 async function syncWindowHiddenState(chat: STMessage[]): Promise<void> {
   const keepStart = resolveKeepStart(chat);
   const covered = coveredSet(chat);
-  const imported = importedHistoryRanges();
+  const ranges = atomicRanges();
+  // 两类整段隐藏:
+  //  - 导入历史:强制隐藏(前史接管);
+  //  - 手写区间:起点一旦退出保留窗口,就把整段一起隐藏。
+  //    原子节点是「一段一条摘要」,只隐藏前半段会让后半段仍发全文、而摘要节点又不注入 →
+  //    前半段剧情凭空消失(信息黑洞)。整段一起藏、摘要整段顶替,才与原子语义一致。
+  const hideRanges = [
+    ...ranges.filter(r => r.forceHide),
+    ...ranges.filter(r => !r.forceHide && r.start < keepStart),
+  ];
   const ctx = getContext();
   if (!ctx) return;
 
@@ -876,9 +899,7 @@ async function syncWindowHiddenState(chat: STMessage[]): Promise<void> {
   for (let i = 0; i < chat.length; i++) {
     const m = chat[i];
     if (!m) continue;
-    // 用户明确把一段旧剧情交给“导入历史”接管时,整段都隐藏,不再受最近窗口保留数影响,
-    // 否则导入正文会与窗口内旧原文重复注入。删除导入节点后会自动走下面的 unhide。
-    const shouldHide = covered.has(i) && (i < keepStart || floorInImportedRanges(i, imported));
+    const shouldHide = covered.has(i) && (i < keepStart || floorInAtomicRanges(i, hideRanges));
     if (shouldHide) {
       if (!m.extra?.bbs_hidden || m.is_system !== true) toHide.push(i);
     } else if (m.extra?.bbs_hidden) {
@@ -1499,7 +1520,7 @@ export async function batchBackfill(opts: BatchBackfillOpts = {}): Promise<Batch
  */
 export function coveredSet(chat: STMessage[]): Set<number> {
   const covered = new Set<number>();
-  for (const [start, end] of importedHistoryRanges()) {
+  for (const { start, end } of atomicRanges()) {
     for (let i = start; i <= Math.min(end, chat.length - 1); i++) {
       if (!chat[i]?.extra?.bbs_omit) covered.add(i); // 番外楼仍遵守“完全忽略”,不因导入范围而被隐藏
     }
@@ -1571,8 +1592,10 @@ function rootsAtLevel(level: number, chat: STMessage[]): RootView[] {
     }
     return out;
   }
+  // 原子节点(导入历史/手写区间)不进压缩链:它们自带显式楼层范围,一旦被普通总结收纳,
+  // 上层节点就没有范围可依;手写正文也会被 AI 改写,违背「按我的措辞」的初衷。
   return memory.summaries
-    .filter(s => s.level === level && !collected.has(s.id))
+    .filter(s => s.level === level && !collected.has(s.id) && !isAtomicSummary(s))
     .sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id))
     .map(s => ({ id: s.id, text: llmString(s.text), createdAt: s.createdAt, timeStart: llmOptionalScalar(s.timeStart), timeEnd: llmOptionalScalar(s.timeEnd) }));
 }
@@ -1701,7 +1724,7 @@ function collectSelectableNodes(chat: STMessage[]): Map<string, SelectableNode> 
     if (lf !== undefined) { acc.push(lf); return; }
     const c = byComp.get(id);
     if (!c) return;
-    if (c.imported) {
+    if (isAtomicSummary(c)) {
       acc.push(c.importedFloorStart ?? 0, c.importedFloorEnd ?? c.importedFloorStart ?? 0);
       return;
     }

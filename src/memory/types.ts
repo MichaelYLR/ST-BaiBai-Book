@@ -331,6 +331,12 @@ export interface LeafExtra {
    * collectLeaves 据此跳过它。
    */
   seed?: boolean;
+  /**
+   * 用户手写(非 AI 生成)的摘要。
+   * 仅用于 UI 标注与排查,**不参与 leafValid 判定**——手写叶子在有效性、重放、注入、
+   * 向量召回上与自动摘要完全同权,否则「手写」会变成二等公民。
+   */
+  manual?: boolean;
   /** 叶子结构版本 */
   v: 1;
 }
@@ -359,10 +365,24 @@ export interface MemSummary {
   childIds: string[];
   /** 从插件外部导入的原子历史节点。它没有逐楼叶子,由下面的楼层范围直接代表旧剧情。 */
   imported?: boolean;
-  /** 导入历史覆盖的起始楼层(当前第一版固定为 0,保留字段供以后扩展分段导入)。 */
+  /**
+   * 用户手写的原子覆盖节点(区间手写摘要)。与 imported 同构:无逐楼叶子,由楼层范围代表剧情。
+   * 与 imported 的唯一差别是隐藏策略——导入是前史接管,强制隐藏;手写区间要等起点退出保留窗口
+   * 才整段隐藏(见 engine.ts syncWindowHiddenState)。
+   */
+  manual?: boolean;
+  /** 原子节点覆盖的起始楼层(导入历史固定为 0;手写区间可为任意起点)。 */
   importedFloorStart?: number;
-  /** 导入历史覆盖的截止楼层(含)。范围内楼层不再重复补摘。 */
+  /** 原子节点覆盖的截止楼层(含)。范围内楼层不再重复补摘。 */
   importedFloorEnd?: number;
+}
+
+/**
+ * 原子覆盖节点(导入历史 / 手写区间):没有逐楼叶子,由楼层范围直接代表剧情。
+ * 二者结构完全同构,只在隐藏策略上不同,故统一用这一个判据,避免各处漏判。
+ */
+export function isAtomicSummary(s: Pick<MemSummary, 'imported' | 'manual'>): boolean {
+  return s.imported === true || s.manual === true;
 }
 
 /** 覆盖型当前状态 */

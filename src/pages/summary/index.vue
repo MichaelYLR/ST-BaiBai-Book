@@ -2,7 +2,7 @@
 import Icon from '@/components/Icon.vue';
 import ConfirmDialog from '@/components/ConfirmDialog.vue';
 import ModalMask from '@/components/ModalMask.vue';
-import { addSummary, appendOpToLatestLeaf, deleteLeafAt, deleteSummary, deleteSummarySubtrees, editLeafAt, editPlan, editSummary, invalidateSummaryAncestors } from '@/memory/apply';
+import { addSummary, appendOpToLatestLeaf, createManualLeaf, createManualRangeSummary, deleteLeafAt, deleteSummary, deleteSummarySubtrees, editLeafAt, editPlan, editSummary, invalidateSummaryAncestors, leafValid } from '@/memory/apply';
 import { apiSettings } from '@/api/settings';
 import { batchBackfill, batchState, cancelBatchBackfill, engineState, floorBackfillState, isAiFloor, resummarizeNow, summarizeFloor, summarizeSelected, syncHiddenNow } from '@/memory/engine';
 import { estimateInjectionTokenBreakdown, refreshInjection, selectViewNodes, type ViewNode } from '@/memory/inject';
@@ -10,6 +10,7 @@ import { compactTimeLabel, formatRange, splitTimeLabel } from '@/memory/timeTag'
 import { relativeTimeLabel, weekdayLabel } from '@/memory/timeRel';
 import { derivedMeta, memory, recomputeDerived } from '@/memory/store';
 import type { SceneFocus } from '@/memory/types';
+import { isAtomicSummary } from '@/memory/types';
 import { getContext } from '@/st/context';
 import { toast } from '@/st/toast';
 import { computed, nextTick, onMounted, onUnmounted, provide, ref } from 'vue';
@@ -315,18 +316,24 @@ const byId = computed<Map<string, ViewNode>>(() => {
       id: l.id, kind: 'leaf', level: 0, text: l.text,
       timeStart: l.timeStart, timeEnd: l.timeEnd, timeLabel: l.timeLabel,
       createdAt: l.createdAt, childIds: [], msgIndex: l.msgIndex, active: l.active,
+      manual: l.manual,
     });
   }
   for (const s of memory.summaries) {
+    const atomic = isAtomicSummary(s);
+    const endFloor = s.importedFloorEnd ?? -1;
     m.set(s.id, {
       id: s.id, kind: 'comp', level: s.level, text: s.text,
       timeStart: s.timeStart, timeEnd: s.timeEnd, timeLabel: s.timeLabel,
       createdAt: s.createdAt, childIds: s.childIds ?? [],
-      msgIndex: s.imported ? (s.importedFloorEnd ?? -1) : -1,
-      active: s.imported === true,
-      atomic: s.imported === true,
+      msgIndex: atomic ? endFloor : -1,
+      // 列表里的 active 只表示「该节点是否已在接管原文」:导入历史恒真(强制隐藏),
+      // 手写区间整段一起隐藏,故终点隐藏即代表整段已接管(与 inject.ts 同口径)。
+      active: s.imported === true || (atomic && getContext()?.chat?.[endFloor]?.is_system === true),
+      atomic,
       floorStart: s.importedFloorStart,
       floorEnd: s.importedFloorEnd,
+      manual: s.manual === true,
     });
   }
   return m;
@@ -370,7 +377,8 @@ function toRow(n: ViewNode, map: Map<string, ViewNode>): SummaryRow {
     floorHi: hi,
     msgIndex: n.kind === 'leaf' ? n.msgIndex : undefined,
     stale: false,
-    imported: n.atomic === true,
+    imported: n.atomic === true && n.manual !== true,
+    manual: n.manual === true,
   };
 }
 
@@ -470,6 +478,149 @@ async function saveImportedHistory() {
   recomputeDerived();
   await syncHiddenNow(true);
   toast(`已导入旧总结,接管 #0 - #${floor}`, 'success');
+}
+
+/* ============ 手写摘要 ============
+ * 用户自己写正文,不调 AI。落地两条路径:
+ *  - 单楼 → createManualLeaf 造一条真实叶子(与自动摘要同权:可编辑、可参与总结、可向量召回);
+ *  - 区间 → createManualRangeSummary 造一条原子覆盖节点(区间无法用叶子表达,见 apply.ts 注释)。
+ * 提交前在 manualCheck 里逐条给出「为什么不能写」,避免用户填完正文才被拒。 */
+const manualOpen = ref(false);
+const manualFloorInput = ref('');
+const manualText = ref('');
+const manualTimeStart = ref('');
+const manualTimeEnd = ref('');
+const manualFloorEl = ref<HTMLInputElement | null>(null);
+
+/** 已有的原子覆盖节点(导入历史 / 手写区间),用于冲突提示 */
+const atomicNodes = computed(() => {
+  void derivedMeta.rev;
+  return memory.summaries
+    .filter(s => isAtomicSummary(s) && Number.isFinite(s.importedFloorEnd))
+    .map(s => ({
+      id: s.id,
+      start: Math.max(0, Math.floor(s.importedFloorStart ?? 0)),
+      end: Math.max(0, Math.floor(s.importedFloorEnd as number)),
+      label: s.imported ? '导入历史' : '手写摘要',
+    }));
+});
+
+/** 解析楼层输入:`12` / `#12` / `12-18` / `#12-#18` / `12~18` / `12至18` */
+function parseFloorSpec(raw: string): { start: number; end: number } | null {
+  const s = raw.trim().replace(/\s+/g, '').replace(/[#＃]/g, '');
+  if (!s) return null;
+  const m = s.match(/^(\d+)(?:[-~—－至到](\d+))?$/);
+  if (!m) return null;
+  const a = Number(m[1]);
+  const b = m[2] === undefined ? a : Number(m[2]);
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return null;
+  return { start: Math.min(a, b), end: Math.max(a, b) };
+}
+
+type ManualCheck =
+  | { ok: true; start: number; end: number; single: boolean }
+  | { ok: false; reason: string };
+
+const manualCheck = computed<ManualCheck>(() => {
+  void derivedMeta.rev;
+  const raw = manualFloorInput.value;
+  if (!raw.trim()) return { ok: false, reason: '输入楼层号,如 #12 或区间 #12-#18' };
+  const spec = parseFloorSpec(raw);
+  if (!spec) return { ok: false, reason: '格式无法识别;支持 #12、12、#12-#18' };
+  const chat = getContext()?.chat ?? [];
+  if (!chat.length) return { ok: false, reason: '当前没有聊天记录' };
+  const maxFloor = chat.length - 1;
+  if (spec.end > maxFloor) return { ok: false, reason: `楼层不存在:当前最大楼层为 #${maxFloor}` };
+
+  const ranges = atomicNodes.value;
+  const covering = (f: number) => ranges.find(r => f >= r.start && f <= r.end);
+
+  // —— 单楼:逐项给出精确原因 ——
+  if (spec.start === spec.end) {
+    const f = spec.start;
+    const m = chat[f];
+    if (!m) return { ok: false, reason: `楼层 #${f} 不存在` };
+    if (m.extra?.bbs_omit) return { ok: false, reason: `#${f} 已标为番外,不参与记忆;请先取消番外` };
+    if (m.is_user) return { ok: false, reason: `#${f} 是用户消息;摘要以 AI 楼层为锚点,用户消息会随相邻 AI 楼一并覆盖` };
+    if (!isAiFloor(m)) return { ok: false, reason: `#${f} 不是 AI 剧情楼` };
+    const cover = covering(f);
+    if (cover) return { ok: false, reason: `#${f} 已被${cover.label} ${rangeText(cover.start, cover.end)} 覆盖` };
+    if (leafValid(m)) return { ok: false, reason: `#${f} 已有摘要;请直接编辑,或删除后重写` };
+    return { ok: true, start: f, end: f, single: true };
+  }
+
+  // —— 区间:终点须是 AI 楼,且范围内不能已有摘要或被别的原子节点接管 ——
+  const endMsg = chat[spec.end];
+  if (!endMsg) return { ok: false, reason: `楼层 #${spec.end} 不存在` };
+  if (!isAiFloor(endMsg)) {
+    return { ok: false, reason: '区间终点必须是 AI 剧情楼,避免把尚未回应的用户消息一起隐藏' };
+  }
+  let aiCount = 0;
+  const leafFloors: number[] = [];
+  const coveredFloors: number[] = [];
+  for (let i = spec.start; i <= spec.end; i++) {
+    const m = chat[i];
+    if (!m || m.extra?.bbs_omit) continue; // 番外楼本就彻底忽略,不参与校验也不被覆盖
+    if (isAiFloor(m)) {
+      aiCount++;
+      if (leafValid(m)) leafFloors.push(i);
+    }
+    if (covering(i)) coveredFloors.push(i);
+  }
+  if (!aiCount) return { ok: false, reason: '区间内没有 AI 剧情楼' };
+  if (leafFloors.length) {
+    return { ok: false, reason: `区间内已有摘要:${leafFloors.map(f => `#${f}`).join('、')};请先删除,或缩小范围` };
+  }
+  if (coveredFloors.length) {
+    return { ok: false, reason: `区间内楼层已被原子节点覆盖:${coveredFloors.map(f => `#${f}`).join('、')}` };
+  }
+  return { ok: true, start: spec.start, end: spec.end, single: false };
+});
+
+/** 校验行的文案(模板里只读它,避免在模板里对联合类型做窄化) */
+const manualHint = computed(() => {
+  const c = manualCheck.value;
+  if (!c.ok) return c.reason;
+  return c.single
+    ? `#${c.start} 可手写(当前无摘要)`
+    : `${rangeText(c.start, c.end)} 可手写(将作为一条原子摘要)`;
+});
+
+function openManual() {
+  // 有未摘要楼层就预填最新那层,省一次输入
+  manualFloorInput.value = pendingFloors.value.length ? `#${pendingFloors.value[0]}` : '';
+  manualText.value = '';
+  manualTimeStart.value = '';
+  manualTimeEnd.value = '';
+  manualOpen.value = true;
+  if (!isTouch) void nextTick(() => manualFloorEl.value?.focus());
+}
+function closeManual() {
+  manualOpen.value = false;
+}
+function saveManual() {
+  const chk = manualCheck.value;
+  if (!chk.ok || !manualText.value.trim()) return;
+  const patch = { text: manualText.value, timeStart: manualTimeStart.value, timeEnd: manualTimeEnd.value };
+  if (chk.single) {
+    if (!createManualLeaf(chk.start, patch)) {
+      toast('写入失败:该楼状态已变化,请重试', 'warning');
+      return;
+    }
+  } else if (!createManualRangeSummary(chk.start, chk.end, patch)) {
+    toast('写入失败:请检查区间与正文', 'warning');
+    return;
+  }
+  const label = chk.single ? `#${chk.start}` : rangeText(chk.start, chk.end);
+  closeManual();
+  // 区间路径只写了森林节点(createManualRangeSummary 不走 recomputeDerived),
+  // 必须重算派生才能让「未摘要楼层」与注入视图立刻反映新覆盖范围。
+  recomputeDerived();
+  refreshInjection();
+  // 与普通摘要一致:遵循自动摘要开关对「隐藏」的控制,开关关闭时只刷新注入、不动原文显示。
+  // 手写本身不触发 checkResummary —— 用户刚写完不该被一次 AI 总结请求偷袭。
+  void syncHiddenNow();
+  toast(`已手写 ${label} 的摘要`, 'success');
 }
 
 const searching = computed(() => searchQuery.value.trim().length > 0);
@@ -644,7 +795,7 @@ async function runMerge() {
 const selectionDeleteSummary = computed(() => {
   const map = byId.value;
   const visited = new Set<string>();
-  let leaves = 0, summaries = 0, imported = 0;
+  let leaves = 0, summaries = 0, atomic = 0;
   const walk = (id: string): void => {
     if (visited.has(id)) return;
     visited.add(id);
@@ -656,13 +807,13 @@ const selectionDeleteSummary = computed(() => {
     }
     summaries++;
     if (node.atomic) {
-      imported++;
+      atomic++;
       return;
     }
     for (const childId of node.childIds) walk(childId);
   };
   for (const id of selectedIds.value) walk(id);
-  return { leaves, summaries, imported };
+  return { leaves, summaries, atomic };
 });
 
 const deleteConfirmOpen = ref(false);
@@ -711,15 +862,19 @@ const currentTime = computed(() => derivedMeta.latestStoryTime || memory.state.t
 /** 当前时间的周几(仅标准公历带年份才有);展示用 */
 const currentWeekday = computed(() => weekdayLabel(currentTime.value));
 
-function levelLabel(level: number, imported = false): string {
+function levelLabel(level: number, imported = false, manual = false): string {
+  if (manual) return '手写';
   if (imported) return '导入历史';
   if (level === 0) return '摘要';
   return `总结L${level}`;
 }
-/** 楼层范围标签:单楼 #5,跨楼 #0 - #10 */
+/** 楼层范围文本:单楼 #5,跨楼 #0 - #10 */
+function rangeText(lo: number, hi: number): string {
+  return lo === hi ? `#${lo}` : `#${lo} - #${hi}`;
+}
 function floorLabel(r: SummaryRow): string {
   if (r.floorLo < 0) return '—';
-  return r.floorLo === r.floorHi ? `#${r.floorLo}` : `#${r.floorLo} - #${r.floorHi}`;
+  return rangeText(r.floorLo, r.floorHi);
 }
 
 async function onDelete(r: SummaryRow) {
@@ -729,6 +884,14 @@ async function onDelete(r: SummaryRow) {
   } else {
     if (r.imported) {
       if (!confirm('删除这条导入历史?它接管的旧楼层会重新显示并回到待摘要状态;原世界书内容不受影响。')) return;
+      invalidateSummaryAncestors(r.id);
+      recomputeDerived();
+      await syncHiddenNow(true);
+      return;
+    }
+    // 手写区间节点与导入历史同为原子节点:删掉即解除接管,覆盖范围内楼层回到待摘要/重新显示。
+    if (r.manual) {
+      if (!confirm('删除这条手写摘要?它覆盖的楼层会重新回到待摘要状态,已隐藏的原文会重新显示。')) return;
       invalidateSummaryAncestors(r.id);
       recomputeDerived();
       await syncHiddenNow(true);
@@ -745,8 +908,8 @@ async function onDelete(r: SummaryRow) {
  * nested = 该节点已被某条总结收纳:编辑它不影响上层总结文本(总结只压快照),
  * 弹窗里提示用户「上层总结不会跟着变」,免得改完发现总结里旧信息还在、以为没保存上。 */
 type Editing =
-  | { kind: 'leaf'; msgIndex: number; text: string; timeStart: string; timeEnd: string; nested: boolean }
-  | { kind: 'comp'; compId: string; level: number; text: string; imported: boolean; nested: boolean };
+  | { kind: 'leaf'; msgIndex: number; text: string; timeStart: string; timeEnd: string; nested: boolean; manual: boolean }
+  | { kind: 'comp'; compId: string; level: number; text: string; imported: boolean; manual: boolean; nested: boolean };
 const editing = ref<Editing | null>(null);
 
 /** 该 id 是否已被任何总结的 childIds 收纳(= 展开视图里的深层行) */
@@ -765,9 +928,13 @@ function openEdit(r: SummaryRow) {
       timeStart: r.timeStart ?? fb.start ?? '',
       timeEnd: r.timeEnd ?? fb.end ?? '',
       nested: isNested(r.id),
+      manual: r.manual === true,
     };
   } else if (r.kind === 'comp') {
-    editing.value = { kind: 'comp', compId: r.id, level: r.level, text: r.text, imported: r.imported === true, nested: isNested(r.id) };
+    editing.value = {
+      kind: 'comp', compId: r.id, level: r.level, text: r.text,
+      imported: r.imported === true, manual: r.manual === true, nested: isNested(r.id),
+    };
   }
 }
 function cancelEdit() {
@@ -993,6 +1160,16 @@ provide(SUMMARY_CTX, {
           v-if="!selectMode"
           class="bbs-btn bbs-btn-sm"
           type="button"
+          title="自己写一条摘要挂到指定楼层(不调用 AI)"
+          @click="openManual"
+        >
+          <Icon name="edit" />
+          <span class="bbs-btn-label">手写摘要</span>
+        </button>
+        <button
+          v-if="!selectMode"
+          class="bbs-btn bbs-btn-sm"
+          type="button"
           :disabled="engineState.running"
           title="粘贴并导入使用柏宝书之前的旧总结"
           @click="openImportHistory"
@@ -1135,13 +1312,14 @@ provide(SUMMARY_CTX, {
           <header class="bbs-summary-meta">
             <!-- 总结:层级标签 + 范围药丸 + 相对时间(留题首行)+ 绝对时间(窄屏换行) -->
             <template v-if="r.kind === 'comp'">
-              <span class="bbs-summary-badge">{{ levelLabel(r.level, r.imported) }}</span>
+              <span class="bbs-summary-badge" :class="{ 'is-manual': r.manual }">{{ levelLabel(r.level, r.imported, r.manual) }}</span>
               <span class="bbs-summary-loc">{{ floorLabel(r) }}</span>
               <span v-if="rowRelative(r)" class="bbs-summary-rel">({{ rowRelative(r) }})</span>
               <span v-if="rowTime(r)" class="bbs-summary-time">{{ rowTime(r) }}</span>
             </template>
             <!-- 摘要:相对时间 + 楼层号都做成等高小标签(盒子居中,免去 CJK 基线下沉),绝对时间作题首文本(窄屏换行) -->
             <template v-else>
+              <span v-if="r.manual" class="bbs-summary-badge is-manual">手写</span>
               <span v-if="rowRelative(r)" class="bbs-summary-rel">{{ rowRelative(r) }}</span>
               <span class="bbs-summary-loc">{{ floorLabel(r) }}</span>
               <span v-if="rowTime(r)" class="bbs-summary-dateline">{{ rowTime(r) }}</span>
@@ -1153,7 +1331,7 @@ provide(SUMMARY_CTX, {
               <button
                 class="bbs-summary-act"
                 type="button"
-                :title="r.imported ? '编辑导入历史' : r.kind === 'comp' ? '编辑总结' : '编辑摘要'"
+                :title="r.manual ? '编辑手写摘要' : r.imported ? '编辑导入历史' : r.kind === 'comp' ? '编辑总结' : '编辑摘要'"
                 @click="openEdit(r)"
               >
                 <Icon name="edit" />
@@ -1162,7 +1340,7 @@ provide(SUMMARY_CTX, {
                 v-if="!r.isChild"
                 class="bbs-summary-act bbs-summary-del"
                 type="button"
-                :title="r.imported ? '删除导入历史' : r.kind === 'comp' ? '删除总结(下层会展开)' : '删除摘要'"
+                :title="r.manual ? '删除手写摘要(原文恢复显示)' : r.imported ? '删除导入历史' : r.kind === 'comp' ? '删除总结(下层会展开)' : '删除摘要'"
                 @click="onDelete(r)"
               >
                 <Icon name="trash" />
@@ -1257,9 +1435,66 @@ provide(SUMMARY_CTX, {
       将永久删除所选 {{ selectionSummary.count }} 个条目所代表的全部内容
       ({{ selectionDeleteSummary.leaves }} 条逐楼摘要、{{ selectionDeleteSummary.summaries }} 条总结)。
       选中的总结所收纳的下层摘要也会一并删除；逐楼摘要带来的物品、计划、时间地点等状态会按剩余摘要重新计算，原文楼层仍保持隐藏。
-      <template v-if="selectionDeleteSummary.imported">导入历史覆盖的原文楼层会重新显示。</template>
+      <template v-if="selectionDeleteSummary.atomic">原子摘要(导入历史 / 手写区间)覆盖的原文楼层会重新显示。</template>
       此操作无法撤销，继续?
     </ConfirmDialog>
+
+    <!-- ===== 手写摘要弹窗 ===== -->
+    <ModalMask :open="manualOpen" @close="closeManual">
+      <div class="bbs-modal" role="dialog" aria-modal="true" aria-label="手写摘要">
+        <header class="bbs-modal-head">
+          <span class="bbs-modal-title">手写摘要</span>
+          <button class="bbs-summary-act" type="button" title="关闭" @click="closeManual"><Icon name="close" /></button>
+        </header>
+        <p class="bbs-field-hint bbs-manual-note">
+          自己写一段摘要替代原文。填单楼写成一条楼层摘要(可编辑、参与总结与向量召回);填区间则作为一条覆盖该段的原子摘要。
+        </p>
+        <label class="bbs-modal-field">
+          <span class="bbs-modal-label">楼层</span>
+          <input
+            ref="manualFloorEl"
+            v-model="manualFloorInput"
+            class="bbs-input"
+            type="text"
+            placeholder="如 #12,或区间 #12-#18"
+          />
+          <span class="bbs-field-hint" :class="manualCheck.ok ? 'is-ok' : 'is-bad'">
+            {{ manualHint }}
+          </span>
+        </label>
+        <div class="bbs-modal-field bbs-time-pair">
+          <label class="bbs-time-col">
+            <span class="bbs-modal-label">起始时间(可选)</span>
+            <input v-model="manualTimeStart" class="bbs-input" type="text" placeholder="如 1988/9/29 21:00" />
+          </label>
+          <label class="bbs-time-col">
+            <span class="bbs-modal-label">结束时间(可选)</span>
+            <input v-model="manualTimeEnd" class="bbs-input" type="text" placeholder="如 1988/9/29 21:30" />
+          </label>
+        </div>
+        <label class="bbs-modal-field">
+          <span class="bbs-modal-label">摘要正文</span>
+          <textarea
+            v-model="manualText"
+            class="bbs-input bbs-modal-textarea"
+            rows="8"
+            placeholder="按时间顺序写下这段剧情…"
+          ></textarea>
+        </label>
+        <p class="bbs-field-hint bbs-manual-warning">
+          手写摘要只记录剧情文字:不会自动登记物品、角色、计划或变量变动;故事内时间仅在填写后推进。也不会自动触发总结压缩。
+        </p>
+        <footer class="bbs-modal-foot">
+          <button class="bbs-btn" type="button" @click="closeManual">取消</button>
+          <button
+            class="bbs-btn bbs-btn-primary"
+            type="button"
+            :disabled="!manualCheck.ok || !manualText.trim()"
+            @click="saveManual"
+          >保存</button>
+        </footer>
+      </div>
+    </ModalMask>
 
     <!-- ===== 导入旧总结弹窗 ===== -->
     <ModalMask :open="importHistoryOpen" @close="closeImportHistory">
@@ -1374,7 +1609,9 @@ provide(SUMMARY_CTX, {
       <div v-if="editing" class="bbs-modal" role="dialog" aria-modal="true" :aria-label="editing.kind === 'comp' ? '编辑总结' : '编辑摘要'">
         <header class="bbs-modal-head">
           <span class="bbs-modal-title">
-            {{ editing.kind === 'comp' ? `编辑${levelLabel(editing.level, editing.imported)}` : `编辑摘要 · 楼层 #${editing.msgIndex}` }}
+            {{ editing.kind === 'comp'
+              ? `编辑${levelLabel(editing.level, editing.imported, editing.manual)}`
+              : `编辑${editing.manual ? '手写摘要' : '摘要'} · 楼层 #${editing.msgIndex}` }}
           </span>
           <button class="bbs-summary-act" type="button" title="关闭" @click="cancelEdit"><Icon name="close" /></button>
         </header>
@@ -1396,7 +1633,7 @@ provide(SUMMARY_CTX, {
           </label>
         </div>
         <label class="bbs-modal-field">
-          <span class="bbs-modal-label">{{ editing.kind === 'comp' ? (editing.imported ? '导入历史正文' : '总结正文') : '摘要正文' }}</span>
+          <span class="bbs-modal-label">{{ editing.kind === 'comp' ? (editing.manual ? '手写摘要正文' : editing.imported ? '导入历史正文' : '总结正文') : '摘要正文' }}</span>
           <textarea v-model="editing.text" class="bbs-input bbs-modal-textarea" rows="8"></textarea>
         </label>
         <footer class="bbs-modal-foot">
@@ -1432,6 +1669,21 @@ provide(SUMMARY_CTX, {
 }
 .bbs-import-warning {
   color: var(--bbs-warning);
+}
+/* —— 手写摘要弹窗 —— */
+.bbs-manual-note {
+  margin-bottom: 14px;
+}
+.bbs-manual-warning {
+  margin-top: 10px;
+  color: var(--bbs-warning);
+}
+/* 楼层校验行:可写=中性提示,不可写=红色原因,填完正文前就能看到为什么不行 */
+.bbs-field-hint.is-ok {
+  color: var(--bbs-ink-muted);
+}
+.bbs-field-hint.is-bad {
+  color: var(--bbs-danger);
 }
 /* 编辑已被总结收纳的节点时的提醒 */
 .bbs-nested-hint {

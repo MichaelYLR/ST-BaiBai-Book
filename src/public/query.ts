@@ -10,6 +10,7 @@ import type { ViewNode } from '@/memory/select';
 import { memory } from '@/memory/store';
 import { cleanBody, latestStoryTime } from '@/memory/timeTag';
 import type { JsonValue, MemSummary } from '@/memory/types';
+import { isAtomicSummary } from '@/memory/types';
 import { getContext } from '@/st/context';
 import { PLUGIN_VERSION } from '@/version';
 import type {
@@ -168,6 +169,9 @@ function buildHistoryNodeMap(
     });
   }
   for (const summary of summaries) {
+    const atomic = isAtomicSummary(summary);
+    const endFloor = summary.importedFloorEnd ?? -1;
+    const endHidden = chat?.[endFloor]?.is_system === true;
     byId.set(summary.id, {
       id: summary.id,
       kind: 'comp',
@@ -178,9 +182,9 @@ function buildHistoryNodeMap(
       timeLabel: summary.timeLabel,
       createdAt: summary.createdAt,
       childIds: summary.childIds ?? [],
-      msgIndex: summary.imported ? (summary.importedFloorEnd ?? -1) : -1,
-      active: summary.imported === true,
-      atomic: summary.imported === true,
+      msgIndex: atomic ? endFloor : -1,
+      active: summary.imported === true ? true : atomic && endHidden,
+      atomic,
       floorStart: summary.importedFloorStart,
       floorEnd: summary.importedFloorEnd,
     });

@@ -35,12 +35,13 @@ const isChild = computed(() => props.depth > 0);
       <div class="bbs-summary-main">
         <header class="bbs-summary-meta">
           <template v-if="row.kind === 'comp'">
-            <span class="bbs-summary-badge">{{ ctx.levelLabel(row.level, row.imported) }}</span>
+            <span class="bbs-summary-badge" :class="{ 'is-manual': row.manual }">{{ ctx.levelLabel(row.level, row.imported, row.manual) }}</span>
             <span class="bbs-summary-loc">{{ ctx.floorLabel(row) }}</span>
             <span v-if="ctx.rowRelative(row)" class="bbs-summary-rel">({{ ctx.rowRelative(row) }})</span>
             <span v-if="ctx.rowTime(row)" class="bbs-summary-time">{{ ctx.rowTime(row) }}</span>
           </template>
           <template v-else>
+            <span v-if="row.manual" class="bbs-summary-badge is-manual">手写</span>
             <span v-if="ctx.rowRelative(row)" class="bbs-summary-rel">{{ ctx.rowRelative(row) }}</span>
             <span class="bbs-summary-loc">{{ ctx.floorLabel(row) }}</span>
             <span v-if="ctx.rowTime(row)" class="bbs-summary-dateline">{{ ctx.rowTime(row) }}</span>
@@ -48,10 +49,10 @@ const isChild = computed(() => props.depth > 0);
           <!-- 操作键:编辑对任何层级开放(结构安全:不改 id、不断链;叶子改完向量索引自动重 embed,
                总结不进向量库、只影响上下文注入);删除仅根行——删深层叶子会级联删整条祖先总结链 -->
           <span class="bbs-summary-acts">
-            <button class="bbs-summary-act" type="button" :title="row.imported ? '编辑导入历史' : row.kind === 'comp' ? '编辑总结' : '编辑摘要'" @click="ctx.openEdit(row)">
+            <button class="bbs-summary-act" type="button" :title="row.manual ? '编辑手写摘要' : row.imported ? '编辑导入历史' : row.kind === 'comp' ? '编辑总结' : '编辑摘要'" @click="ctx.openEdit(row)">
               <Icon name="edit" />
             </button>
-            <button v-if="!isChild" class="bbs-summary-act bbs-summary-del" type="button" :title="row.imported ? '删除导入历史' : row.kind === 'comp' ? '删除总结(下层会展开)' : '删除摘要'" @click="ctx.onDelete(row)">
+            <button v-if="!isChild" class="bbs-summary-act bbs-summary-del" type="button" :title="row.manual ? '删除手写摘要(原文恢复显示)' : row.imported ? '删除导入历史' : row.kind === 'comp' ? '删除总结(下层会展开)' : '删除摘要'" @click="ctx.onDelete(row)">
               <Icon name="trash" />
             </button>
           </span>
